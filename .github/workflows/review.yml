@@ -1,7 +1,7 @@
 name: review
 
 # Called from each repository's pull_request workflow (see README). Kept in one place so a
-# withdrawn free model, the opencode pin or the prompt is changed once, not per repository.
+# withdrawn free model, the opencode action or the prompt is changed once, not per repository.
 on:
   workflow_call:
     inputs:
@@ -12,8 +12,10 @@ on:
         # Free models are withdrawn without notice; that shows as this job failing.
         default: opencode/glm-5.3-flash-free
     secrets:
+      # Not required: fork and Dependabot runs pass it empty, and the job's if skips them.
+      # Whether a required secret passed empty fails the call first is not verified.
       OPENCODE_API_KEY:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -22,12 +24,13 @@ jobs:
   review:
     # Fork PRs get no secrets, so the run could only fail. pull_request_target is not used
     # because it would hand the secret to code from the fork. A run started by Dependabot
-    # gets no Actions secrets either, and opencode refuses an actor without write
-    # permission; a person pushing to a Dependabot PR still gets a review.
+    # gets no Actions secrets either, and opencode refuses any bot actor (its permission check
+    # is for collaborators); a person pushing to a bot's PR still gets a review. pull_request only:
+    # a pull_request_target caller would run this with the secret on a fork's PR.
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
+      !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # A push makes the review of the previous head pointless. Each run still posts its own
@@ -52,19 +55,17 @@ jobs:
       # shallow and cuts the merge base off a PR of 20 commits or more. Find it while the
       # history is still whole; a two-dot diff then needs only the two commits. The end is the
       # event's head, not HEAD, so a force push between the event and the job does not drag
-      # unrelated commits into the diff. A head the force push already removed was not
-      # fetched; the review then reads up to HEAD, the branch as it is now.
-      - id: base
+      # unrelated commits into the diff. checkout fetches the event's merge commit, whose
+      # parent is that head, so the head is always there.
+      - name: Write the PR's diff outside the worktree
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # Assigned first: a failing substitution inside echo's argument would not stop the step.
         run: |
-          end="$HEAD_SHA"
-          git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || end=HEAD
-          merge_base=$(git merge-base "$BASE_SHA" "$end")
-          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
-          echo "end=$end" >> "$GITHUB_OUTPUT"
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          mkdir -p "$RUNNER_TEMP/opencode-review"
+          git diff "$merge_base" "$HEAD_SHA" > "$RUNNER_TEMP/opencode-review/pr.diff"
       # shortcut: the action installs whatever opencode release is latest, so the binary is
       # not pinned, and opencode fetches the PR branch anonymously, which only a public
       # repository allows. Pin it and give the fetch credentials before a private one calls this.
@@ -75,20 +76,23 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           # The action's agent input is not read at v1.19.4, so the agent comes from config.
           # Without it the build agent may edit files, and the dirty tree turns the run into
-          # a push that contents: read refuses, losing the review. The last matching rule
-          # wins, so the --output deny (which writes the diff to a file) comes after the allows.
+          # a push that contents: read refuses, losing the review. No shell at all: an allowed
+          # git command could still write through a redirect or an abbreviated --output, and a
+          # written .git/config runs commands. The diff is read from a file written above,
+          # outside the worktree; the last matching rule wins, so that one directory is
+          # allowed after everything outside the worktree is denied.
           OPENCODE_CONFIG_CONTENT: >-
             {"default_agent": "plan", "share": "disabled", "permission": {"edit": "deny",
-            "webfetch": "deny", "websearch": "deny", "bash": {"*": "deny", "git diff*": "allow",
-            "git log*": "allow", "git show*": "allow", "*--output*": "deny"}}}
+            "bash": "deny", "webfetch": "deny", "websearch": "deny", "external_directory":
+            {"*": "deny", "${{ runner.temp }}/opencode-review/*": "allow"}}}
         with:
           model: ${{ inputs.model }}
           use_github_token: true
           prompt: |
             このプルリクエストをレビューし、結果を日本語で 1 件のコメントにまとめてください。
-            - 変更は `git diff ${{ steps.base.outputs.merge_base }} ${{ steps.base.outputs.end }}` で読む
+            - 変更の diff は `${{ runner.temp }}/opencode-review/pr.diff` にある。まずそれを読み、周りのコードはリポジトリのファイルを読んで確かめる
             - 既存のコメントやレビューの指摘は繰り返さず、変更そのものを独立に見る
-            - ファイルを編集しない。コマンドは git の読み取りだけを使う
+            - ファイルを編集しない。コマンドは使えない
             - 見るのはバグ、壊れうる入力・順序、テストが押さえていない挙動、セキュリティ
             - 書式や好みの指摘は書かない
             - 指摘ごとにファイルと行、何が起きるか、直し方を書く
