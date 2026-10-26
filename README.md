@@ -41,3 +41,4 @@ To use another model, pass `with: { model: <provider/id> }`.
 
 - Public repositories only for now. opencode fetches the PR branch without credentials, and the opencode binary the action installs is the latest release, not a pinned one.
 - When a free model is withdrawn, the job fails until `model` is changed here.
+- The model reads the PR's diff and messages, so text in them can steer what the review says. It cannot write anything but the comment.

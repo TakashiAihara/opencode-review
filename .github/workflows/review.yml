@@ -52,15 +52,19 @@ jobs:
       # shallow and cuts the merge base off a PR of 20 commits or more. Find it while the
       # history is still whole; a two-dot diff then needs only the two commits. The end is the
       # event's head, not HEAD, so a force push between the event and the job does not drag
-      # unrelated commits into the diff.
+      # unrelated commits into the diff. A head the force push already removed was not
+      # fetched; the review then reads up to HEAD, the branch as it is now.
       - id: base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # Assigned first: a failing substitution inside echo's argument would not stop the step.
         run: |
-          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          end="$HEAD_SHA"
+          git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null || end=HEAD
+          merge_base=$(git merge-base "$BASE_SHA" "$end")
           echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          echo "end=$end" >> "$GITHUB_OUTPUT"
       # shortcut: the action installs whatever opencode release is latest, so the binary is
       # not pinned, and opencode fetches the PR branch anonymously, which only a public
       # repository allows. Pin it and give the fetch credentials before a private one calls this.
@@ -82,7 +86,7 @@ jobs:
           use_github_token: true
           prompt: |
             このプルリクエストをレビューし、結果を日本語で 1 件のコメントにまとめてください。
-            - 変更は `git diff ${{ steps.base.outputs.merge_base }} ${{ github.event.pull_request.head.sha }}` で読む
+            - 変更は `git diff ${{ steps.base.outputs.merge_base }} ${{ steps.base.outputs.end }}` で読む
             - 既存のコメントやレビューの指摘は繰り返さず、変更そのものを独立に見る
             - ファイルを編集しない。コマンドは git の読み取りだけを使う
             - 見るのはバグ、壊れうる入力・順序、テストが押さえていない挙動、セキュリティ
