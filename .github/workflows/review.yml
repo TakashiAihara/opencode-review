@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The prompt carries no diff; the agent reads it from git against the base.
+          # The merge base below needs the history of both sides.
           fetch-depth: 0
           # The review pushes nothing, so the token has no reason to sit in .git/config.
           persist-credentials: false
@@ -61,7 +61,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        # Assigned first: a failing substitution inside echo's argument would not stop the step.
+        # Assigned first so a failing merge-base stops the step instead of writing an empty diff.
         run: |
           merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
           mkdir -p "$RUNNER_TEMP/opencode-review"
@@ -81,6 +81,9 @@ jobs:
           # written .git/config runs commands. The diff is read from a file written above,
           # outside the worktree; the last matching rule wins, so that one directory is
           # allowed after everything outside the worktree is denied.
+          # The PR's own opencode.json and .opencode/ (agents, plugins, tools) would otherwise load
+          # from the checked-out tree, override the permissions below and run code.
+          OPENCODE_DISABLE_PROJECT_CONFIG: "true"
           OPENCODE_CONFIG_CONTENT: >-
             {"default_agent": "plan", "share": "disabled", "permission": {"edit": "deny",
             "bash": "deny", "webfetch": "deny", "websearch": "deny", "external_directory":
