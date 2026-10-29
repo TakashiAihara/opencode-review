@@ -141,15 +141,17 @@ jobs:
           [ -n "$API_KEY" ] && patterns+=(-e "$API_KEY")
           # 0 is a match and 1 no match; anything else means the check did not run, so it is
           # treated as a match rather than letting the bundle through unchecked.
-          rc=0; grep -rqF "${patterns[@]}" "$out" || rc=$?
+          # -R follows symlinks, which upload-artifact also follows; cp -r copies them as links.
+          rc=0; grep -RqF "${patterns[@]}" "$out" || rc=$?
           if [ "$rc" != 1 ]; then
             rm -rf "$out"
             echo "::error::The collected logs contain the API key or the GitHub token, or could not be checked (grep exit $rc); they were deleted, not uploaded."
             exit 1
           fi
 
-      # Only after the collect step finished: a failure before its key check (a failed export
-      # or copy) would otherwise upload files nobody checked.
+      # Only after the collect step finished: a failure before its key check (a failed list or
+      # copy; a failed export only warns, and its file is still checked) would otherwise upload
+      # files nobody checked.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.collect.outcome == 'success'
         with:
