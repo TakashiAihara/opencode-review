@@ -122,10 +122,14 @@ jobs:
           sessions=$(env -u API_KEY -u GH_TOKEN_IN opencode session list --format json)
           ids=$(jq -r '.[].id' <<< "$sessions")
           # session list returns root sessions only; a subagent the model starts through the task
-          # tool runs in a child session, named in that tool call's metadata.
+          # tool runs in a child session, named in that tool call's metadata. The model picks that
+          # id and may name a session already exported, so each id is exported once.
+          declare -A seen
           while [ -n "$ids" ]; do
             next=""
             for id in $ids; do
+              [ -n "${seen[$id]:-}" ] && continue
+              seen[$id]=1
               file="$out/session-$id.json"
               env -u API_KEY -u GH_TOKEN_IN opencode export "$id" > "$file" || { echo "::warning::export of $id failed"; continue; }
               children=$(jq -r '.messages[].parts[] | select(.type == "tool" and .tool == "task") | .state.metadata.sessionId // empty' "$file")
@@ -135,9 +139,8 @@ jobs:
           done
           log_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log"
           [ -d "$log_dir" ] && cp -r "$log_dir" "$out/log"
-          # The opencode action also writes the token base64-encoded into .git/config, which the
-          # model may read. The key is not required, and an empty pattern would match every line.
-          patterns=(-e "$GH_TOKEN_IN" -e "$(printf 'x-access-token:%s' "$GH_TOKEN_IN" | base64 -w0)")
+          # The key is not required, and an empty pattern would match every line.
+          patterns=(-e "$GH_TOKEN_IN")
           [ -n "$API_KEY" ] && patterns+=(-e "$API_KEY")
           # 0 is a match and 1 no match; anything else means the check did not run, so it is
           # treated as a match rather than letting the bundle through unchecked.
