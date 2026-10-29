@@ -145,5 +145,5 @@ jobs:
           name: opencode-review-logs
           path: ${{ runner.temp }}/opencode-review/logs
           if-no-files-found: ignore
-          # Long enough to look at a week of reviews; the bundle is about 15 KB a run.
+          # Long enough to look at a week of reviews; the bundle is about 35 KB a run.
           retention-days: 14
