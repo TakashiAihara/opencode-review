@@ -117,16 +117,27 @@ jobs:
         run: |
           out="$RUNNER_TEMP/opencode-review/logs"
           mkdir -p "$out"
-          command -v opencode >/dev/null || { echo "opencode was not installed; nothing to collect"; exit 0; }
-          # Assigned first so a failing list stops the step instead of collecting nothing.
+          command -v opencode >/dev/null || { echo "::warning::opencode was not installed; nothing to collect"; exit 0; }
+          # Assigned first so a failing list or jq stops the step instead of collecting nothing.
           sessions=$(env -u API_KEY -u GH_TOKEN_IN opencode session list --format json)
-          for id in $(jq -r '.[].id' <<< "$sessions"); do
-            env -u API_KEY -u GH_TOKEN_IN opencode export "$id" > "$out/session-$id.json" || echo "::warning::export of $id failed"
+          ids=$(jq -r '.[].id' <<< "$sessions")
+          # session list returns root sessions only; a subagent the model starts through the task
+          # tool runs in a child session, named in that tool call's metadata.
+          while [ -n "$ids" ]; do
+            next=""
+            for id in $ids; do
+              file="$out/session-$id.json"
+              env -u API_KEY -u GH_TOKEN_IN opencode export "$id" > "$file" || { echo "::warning::export of $id failed"; continue; }
+              children=$(jq -r '.messages[].parts[] | select(.type == "tool" and .tool == "task") | .state.metadata.sessionId // empty' "$file")
+              next="$next $children"
+            done
+            ids=$(xargs <<< "$next")
           done
           log_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log"
           [ -d "$log_dir" ] && cp -r "$log_dir" "$out/log"
-          # The key is not required, and an empty pattern would match every line.
-          patterns=(-e "$GH_TOKEN_IN")
+          # The opencode action also writes the token base64-encoded into .git/config, which the
+          # model may read. The key is not required, and an empty pattern would match every line.
+          patterns=(-e "$GH_TOKEN_IN" -e "$(printf 'x-access-token:%s' "$GH_TOKEN_IN" | base64 -w0)")
           [ -n "$API_KEY" ] && patterns+=(-e "$API_KEY")
           # 0 is a match and 1 no match; anything else means the check did not run, so it is
           # treated as a match rather than letting the bundle through unchecked.
@@ -145,5 +156,6 @@ jobs:
           name: opencode-review-logs
           path: ${{ runner.temp }}/opencode-review/logs
           if-no-files-found: ignore
-          # Long enough to look at a week of reviews; the bundle is about 35 KB a run.
+          # Two weeks of reviews to compare prompt changes against; the bundle was 34 KB zipped
+          # for a 47-line diff and grows with the files the model reads.
           retention-days: 14

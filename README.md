@@ -6,6 +6,7 @@ A reusable GitHub Actions workflow that reviews each pull request with [opencode
 - The agent can only read: it runs as opencode's `plan` agent with no shell, no file edits, no web fetch or search, and no paths outside the repository except the PR's diff, which a step writes beforehand. The repository's own opencode config (`opencode.json`, `.opencode/`) is not loaded, so a PR cannot widen these.
 - Drafts are reviewed too. The latest of a burst of pushes gets a new review (earlier runs are cancelled); an earlier comment is not edited.
 - Pull requests from forks, and runs started by a bot, are skipped: forks and Dependabot get no secrets, and opencode refuses bot actors.
+- opencode's session (the prompt, the PR text and files the model read, its replies, tool calls and reasoning) and its log are kept for 14 days as the run's artifact `opencode-review-logs`, for tuning the prompt. In a public repository anyone signed in to GitHub can download it. If the bundle contains the API key or the GitHub token, or cannot be checked, it is deleted and the job fails.
 
 ## Use
 
@@ -41,4 +42,4 @@ To use another model, pass `with: { model: <provider/id> }`.
 
 - Public repositories only for now. opencode fetches the PR branch without credentials, and the opencode binary the action installs is the latest release, not a pinned one.
 - When a free model is withdrawn, the job fails until `model` is changed here.
-- The model reads the PR's diff and messages, so text in them can steer what the review says. With no shell and no edits, the comment is the only thing it writes.
+- The model reads the PR's diff and messages, so text in them can steer what the review says. With no shell and no edits, the comment and the session in the artifact are the only things it writes.
