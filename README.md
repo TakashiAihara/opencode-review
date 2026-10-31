@@ -38,7 +38,7 @@ jobs:
 
 To use another model, pass `with: { model: <provider/id> }`.
 
-`opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
+`opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it; opencode's releases are immutable from 1.17.0, so that is the oldest version this accepts. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
 
 ## Review instructions per path
 
@@ -60,7 +60,6 @@ reviews:
 - The file is read from the base branch, not the pull request, so a pull request cannot edit it to change its own review. An edit to the file takes effect once it is merged.
 - The job fails when the file has no `reviews.path_instructions` list (a misspelt `reviews` or `path_instructions`, or `path_instructions` at the top level), when an entry lacks `path` or `instructions` or has instructions over 20000 characters, and when the file is not valid YAML. Other keys are ignored, so a misspelt key next to the list is not caught. The run log says how many entries were read and which matched.
 - This is separate from `AGENTS.md`, which the reviewer does not load at the repository root. An `AGENTS.md` or `CONTEXT.md` in a subdirectory, including one the pull request adds, is still attached when the reviewer reads a file there; opencode has no setting to stop that. `CLAUDE.md` is not loaded.
-
 
 ## Limits
 

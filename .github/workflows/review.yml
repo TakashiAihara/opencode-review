@@ -15,7 +15,8 @@ on:
       opencode-version:
         description: opencode release to review with, as 1.Y.Z (2.x has no github run command)
         type: string
-        # The version openrouter-review pinned after checking it (run 41157201190). It changes
+        # The version openrouter-review pinned after checking it (run 41157201190) and this
+        # repository's review ran on (run 41191844520). It changes
         # only when someone edits this line: a new upstream release does not move it. v2 has no
         # github run command at all (checked at v2.2.5), so leaving 1.x means rewriting the
         # review step.
@@ -169,8 +170,9 @@ jobs:
         run: opencode github run
         env:
           # opencode keeps its database and log under the data directory and reads a global
-          # config from the config directory. Directories of this run's own keep the runner's
-          # config out. They sit outside the directory the agent may read below.
+          # config from the config directory. Directories of this run's own let the collect
+          # step read this run's sessions only, as in the sibling reviewers. They sit outside
+          # the directory the agent may read below.
           XDG_DATA_HOME: ${{ runner.temp }}/opencode-review-data/data
           XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-review-data/config
           # Set to an absolute path it would take precedence over the data directory; empty is
@@ -194,8 +196,9 @@ jobs:
           # allowed after everything outside the worktree is denied.
           # The PR's own opencode.json and .opencode/ (agents, plugins, tools) would otherwise load
           # from the checked-out tree, override the permissions below and run code.
-          # small_model is the same model: opencode otherwise names the session with a model of
-          # its own choosing, which on OpenRouter was a paid one (openrouter-review run
+          # small_model is the same model: opencode otherwise names the session with a small
+          # model of its own choosing, so the PR text would reach a model other than the one
+          # picked for its data terms (on OpenRouter it was a paid one, openrouter-review run
           # 40321742692). toJSON quotes the caller's model so a stray quote cannot rewrite the
           # permissions around it.
           OPENCODE_DISABLE_PROJECT_CONFIG: "true"
@@ -275,6 +278,6 @@ jobs:
           name: opencode-review-logs
           path: ${{ runner.temp }}/opencode-review/logs
           if-no-files-found: ignore
-          # Two weeks of reviews to compare prompt changes against; the bundle was 34 KB zipped
-          # for a 47-line diff and grows with the files the model reads.
+          # Two weeks of reviews to compare prompt changes against; the bundle was 41 KB zipped
+          # in run 41191844520 and grows with the files the model reads.
           retention-days: 14
