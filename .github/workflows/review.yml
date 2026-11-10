@@ -251,7 +251,7 @@ jobs:
             - 見るのはバグ、壊れうる入力・順序、テストが押さえていない挙動、セキュリティ
             - 書式や好みの指摘は書かない
             - 指摘ごとにファイルと行、何が起きるか、直し方を書く
-            - 指摘が無ければ「指摘なし」とだけ書く
+            - 指摘が無ければ、1 行目の次に「指摘なし」とだけ書く
 
       # The session (prompts, replies, tool calls, the model's reasoning when it gives any) and
       # opencode's own log are what tuning the prompt needs, and they are gone with the runner
