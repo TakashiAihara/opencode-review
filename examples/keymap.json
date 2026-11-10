@@ -1,0 +1,10 @@
+{
+  "_comment": "pass with --keymap to override the defaults; see packages/web/src/keys.ts for them",
+
+  "row.next": ["j", "down"],
+  "row.prev": ["k", "up"],
+
+  "comment.start": ["c", "i"],
+
+  "lines.toggle": null
+}

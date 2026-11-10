@@ -1,0 +1,23 @@
+# Git hooks: the same checks CI runs, failing locally first.
+# Passing here does not skip CI, which runs them again — hooks can be bypassed with --no-verify.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      # Fix and re-stage. There is no reason to fail and make a person do it by hand
+      glob: '*.{js,ts,json}'
+      run: bunx oxfmt {staged_files}
+      stage_fixed: true
+
+    - name: lint
+      glob: '*.{js,ts}'
+      run: bunx oxlint {staged_files}
+
+pre-push:
+  jobs:
+    - name: typecheck
+      run: bun run typecheck
+
+    - name: test
+      run: bun run test

@@ -1,0 +1,21 @@
+{
+  "name": "@akapen/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./addresses": "./src/addresses.ts",
+    "./blocks": "./src/blocks.ts",
+    "./files": "./src/files.ts",
+    "./hosts": "./src/hosts.ts",
+    "./instances": "./src/instances.ts",
+    "./sessions": "./src/sessions.ts",
+    "./store": "./src/store.ts",
+    "./token": "./src/token.ts"
+  },
+  "dependencies": {
+    "@akapen/shared": "workspace:*",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^15.0.0"
+  }
+}

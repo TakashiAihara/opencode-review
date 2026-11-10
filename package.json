@@ -1,0 +1,36 @@
+{
+  "name": "akapen",
+  "version": "0.0.0",
+  "private": true,
+  "description": "markdown inline review — comments stay out of the file",
+  "workspaces": [
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "start": "bun run build:web && bun run packages/cli/src/cli.ts",
+    "prepare": "lefthook install",
+    "build:web": "bun run --cwd packages/web build",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "sweep": "bun run scripts/sweep.ts"
+  },
+  "devDependencies": {
+    "@akapen/core": "workspace:*",
+    "@akapen/server": "workspace:*",
+    "@playwright/test": "^1.62.1",
+    "@total-typescript/ts-reset": "^0.6.1",
+    "@tsconfig/bun": "^1.0.11",
+    "@tsconfig/strictest": "^2.0.8",
+    "@types/bun": "^1.4.0",
+    "lefthook": "^2.1.10",
+    "oxfmt": "^0.64.0",
+    "oxlint": "^1.79.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

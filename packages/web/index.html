@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>akapen</title>
+<link rel="stylesheet" href="/style.css">
+<!-- Extra CSS always comes last, so overriding the defaults is guaranteed by construction -->
+<link rel="stylesheet" href="/custom.css">
+</head>
+<body>
+<header class="topbar" id="topbar">
+  <span class="brand">akapen</span>
+  <span class="file" id="filePath"></span>
+  <span class="round" id="round"></span>
+  <select class="round-pick" id="roundPick" aria-label="Round to display"></select>
+  <!-- The document's headings. A dropdown and not a column of its own: the columns are spoken for (#76) -->
+  <button type="button" class="outline-toggle" id="outlineToggle" hidden aria-expanded="false" aria-controls="outline">outline</button>
+  <!-- Shown only while another akapen on this host is answering -->
+  <button type="button" class="peers-toggle" id="peersToggle" hidden aria-expanded="false" aria-controls="peers"></button>
+  <span class="spacer"></span>
+  <label class="toggle"><input type="checkbox" id="showLines"> Line numbers</label>
+  <!-- Only pressed by a reader overriding their OS. Unpressed is the default (auto) -->
+  <button type="button" class="theme-toggle" id="themeToggle" aria-live="polite"></button>
+  <span class="count" id="count"></span>
+  <!-- The headings, as a tree. Inside the header so it follows it while scrolling -->
+  <div class="outline" id="outline" hidden>
+    <nav class="outline-list" id="outlineList" aria-label="Document outline"></nav>
+    <p class="outline-empty" id="outlineEmpty" hidden></p>
+    <label class="outline-depth"><input type="checkbox" id="outlineDeep"> down to h6</label>
+  </div>
+  <!-- The other reviews running beside this one. Inside the header so it follows it while scrolling -->
+  <div class="peers" id="peers" hidden>
+    <div class="peers-title">other akapen on this host</div>
+    <ul class="peers-list" id="peersList"></ul>
+  </div>
+</header>
+<!-- The document is the current round's frozen snapshot. A live change is only announced here; moving on takes a click -->
+<div class="banner" id="banner" hidden>
+  <span class="banner-text" id="bannerText"></span>
+  <button class="primary" id="nextRound">End this round</button>
+</div>
+<!-- Another screen cut a round. This one still holds the old line numbers, so it says so instead of moving on its own -->
+<div class="banner moved" id="movedBar" role="status" hidden>
+  <span class="banner-text" id="movedText"></span>
+  <button class="primary" id="loadCurrent">Load the current round</button>
+</div>
+<!-- While viewing a past round: the document and comments exactly as they were -->
+<div class="banner history" id="historyBar" hidden>
+  <span class="banner-text" id="historyText"></span>
+  <button id="backToCurrent">Back to the current round</button>
+</div>
+<!-- A diagram at its own size (scrolling), or an image fitted to the window. A click or Escape closes it -->
+<dialog id="zoom" class="zoom" aria-label="Enlarged figure" tabindex="-1"></dialog>
+<main class="stage">
+  <div id="doc" class="doc"></div>
+  <!-- Comments go here instead of between the lines, so reading is never interrupted -->
+  <aside id="rail" class="rail">
+    <button type="button" class="rail-close" id="railClose" aria-label="Close the rail" title="Close">×</button>
+    <div id="railAnchored" class="rail-anchored"></div>
+    <!-- Nothing carries over, so earlier unresolved comments stay here -->
+    <section id="railCarried" class="rail-carried" hidden></section>
+  </aside>
+</main>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

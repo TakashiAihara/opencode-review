@@ -1,0 +1,1621 @@
+import * as v from 'valibot';
+import {
+  CommentsPayloadSchema,
+  DocPayloadSchema,
+  InstancesPayloadSchema,
+  ServerEventSchema,
+  type Block,
+  type ChangedState,
+  type Comment,
+  type CommentsPayload,
+  type Doc,
+  type DocPayload,
+  type InstancePeer,
+  type RoundComment,
+  type RoundState,
+} from '@akapen/shared';
+import { bindKeys, loadKeymap } from './keys.ts';
+import {
+  DEEPEST_LEVEL,
+  DEFAULT_DEEPEST,
+  type OutlineEntry,
+  buildOutline,
+  flattenOutline,
+  headingCount,
+} from './outline.ts';
+import { applyTheme, nextTheme, readTheme, saveTheme, type Theme, type ThemeStore } from './theme.ts';
+import { pageTitle } from './title.ts';
+
+/** Elements index.html is expected to have. Missing one fails at startup so it is noticed. */
+function must<T extends HTMLElement = HTMLElement>(id: string): T {
+  const found = document.getElementById(id);
+  if (!found) throw new Error(`akapen: #${id} is missing from index.html`);
+  return found as T;
+}
+
+const docEl = must('doc');
+const railEl = must('rail');
+const anchoredEl = must('railAnchored');
+const carriedEl = must('railCarried');
+const roundPickEl = must<HTMLSelectElement>('roundPick');
+const historyBarEl = must('historyBar');
+const historyTextEl = must('historyText');
+const backBtn = must<HTMLButtonElement>('backToCurrent');
+const railCloseEl = must<HTMLButtonElement>('railClose');
+const filePathEl = must('filePath');
+const countEl = must('count');
+const roundEl = must('round');
+const bannerEl = must('banner');
+const bannerTextEl = must('bannerText');
+const nextRoundBtn = must<HTMLButtonElement>('nextRound');
+const movedBarEl = must('movedBar');
+const movedTextEl = must('movedText');
+const loadCurrentBtn = must<HTMLButtonElement>('loadCurrent');
+const showLines = must<HTMLInputElement>('showLines');
+const topbarEl = must('topbar');
+const themeToggleEl = must<HTMLButtonElement>('themeToggle');
+const peersToggleEl = must<HTMLButtonElement>('peersToggle');
+const peersEl = must('peers');
+const peersListEl = must('peersList');
+const outlineToggleEl = must<HTMLButtonElement>('outlineToggle');
+const outlineEl = must('outline');
+const outlineListEl = must('outlineList');
+const outlineEmptyEl = must('outlineEmpty');
+const outlineDeepEl = must<HTMLInputElement>('outlineDeep');
+
+/**
+ * A comment being written: its range and text, kept alive across re-renders.
+ *
+ * `round` is the round those line numbers were read from. Once the screen has moved on,
+ * the same numbers point at different text, so the range has to be picked again — the
+ * text is what is worth keeping, not the anchor (#100).
+ */
+type Draft = { startLine: number; endLine: number; text: string; round: number | null };
+/** A selected range of lines. */
+type Range = { start: number; end: number };
+/** mermaid is loaded on demand from its own entry. We only initialise and run it. */
+type MermaidLib = {
+  initialize: (o: { startOnLoad: boolean; theme: string }) => void;
+  run: (o: { nodes: ArrayLike<Element> }) => Promise<void>;
+};
+
+type State = {
+  doc: Doc | null;
+  comments: Comment[];
+  /** `viewing` is the earlier round on screen while history is open. The snapshot never changes; comments written on it are filed on that round. */
+  round: RoundState | null;
+  carried: RoundComment[];
+  history: boolean;
+};
+
+let state: State = { doc: null, comments: [], round: null, carried: [], history: false };
+let drag: Range | null = null; // set only while dragging in the gutter
+// The selection. Mouse and keyboard both end up moving this and calling startDraft.
+// Without a single path you immediately grow "the mouse can select a range, the keyboard cannot".
+let sel: Range | null = null;
+let focusLine: number | null = null; // the line the keyboard is on (its first line number)
+let draft: Draft | null = null;
+let active: string | null = null; // the selected bubble (a comment id, or 'draft')
+let mermaidLib: MermaidLib | null = null;
+/**
+ * The round the server is on, as last heard — from a payload or from the stream.
+ *
+ * Kept apart from `state.round`, which is the round this screen was built against.
+ * The two differ exactly while another screen has cut a round and this one has not
+ * been reloaded. Comments written in that window are filed on the round on screen.
+ */
+let serverRound: number | null = null;
+
+/**
+ * Round numbers only ever go up, so this only ever goes up.
+ *
+ * Two paths report it — a payload and the stream — and they are not ordered against each
+ * other. A reply that was in flight while a newer round opened would otherwise walk the
+ * number backwards, hide the notice, and leave the screen behind with nothing saying so.
+ */
+function noteServerRound(n: number): void {
+  serverRound = Math.max(serverRound ?? 0, n);
+}
+
+/** dataset holds strings only. Reading and writing line numbers goes through here. */
+function setLine(node: HTMLElement, key: string, value: number): void {
+  node.dataset[key] = String(value);
+}
+
+function getLine(node: Element, key: string): number {
+  return Number((node as HTMLElement).dataset[key]);
+}
+
+/** An event target arrives as EventTarget. Return it only when it is an element. */
+function targetEl(e: Event): HTMLElement | null {
+  return e.target instanceof HTMLElement ? e.target : null;
+}
+
+/** Errors arrive as unknown. Only the message is fit to show. */
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The server's own words, falling back to the status.
+ *
+ * A refusal means more than one thing — the range points at nothing, the file is
+ * mid-write — and a bare status code tells the person neither.
+ */
+async function failureOf(res: Response): Promise<Error> {
+  const text = await res.text().catch(() => '');
+  return new Error(text.trim() || `HTTP ${res.status}`);
+}
+
+/**
+ * Read a body against the contract instead of asserting it.
+ *
+ * A cast holds only at compile time, and this is the one place where compile time
+ * says nothing: akapen is left open while the file is edited, so a tab can outlive
+ * the server it was built against. Checking here turns a shape mismatch into the
+ * failure message the surrounding code already knows how to show, instead of an
+ * undefined surfacing halfway through a render.
+ *
+ * The HTTP status stays with the caller — each one already decides what a failed
+ * request means for its own bit of the screen.
+ */
+async function decode<S extends v.GenericSchema>(res: Response, schema: S): Promise<v.InferOutput<S>> {
+  return v.parse(schema, await res.json());
+}
+
+nextRoundBtn.addEventListener('click', async () => {
+  nextRoundBtn.disabled = true;
+  try {
+    const res = await fetch('/api/rounds', { method: 'POST' });
+    // A refused cut is not a failure to report and forget: the server says the file is
+    // being written or is empty right now, and clicking again once it settles works.
+    if (!res.ok) throw await failureOf(res);
+    const payload = await decode(res, DocPayloadSchema);
+    // A new round means a new document, so swapping it wholesale is fine — a person asked for it
+    draft = null;
+    sel = null;
+    focusLine = null;
+    active = null;
+    applyPayload(payload);
+  } catch (err) {
+    bannerTextEl.textContent = `could not close the round (${messageOf(err)})`;
+  } finally {
+    nextRoundBtn.disabled = false;
+  }
+});
+
+/** Update after only comments changed. The document is left alone. */
+function applyComments(payload: CommentsPayload) {
+  state = {
+    ...state,
+    comments: payload.comments ?? state.comments,
+    carried: payload.carried ?? state.carried,
+  };
+  markCommentedRows();
+  renderRail();
+  layoutRail();
+  updateCount();
+}
+
+// A live change never swaps the document. Show how often it changed; the person decides whether to move on.
+function renderBanner(changed: ChangedState | null | undefined) {
+  if (!changed || !changed.dirty) {
+    bannerEl.hidden = true;
+    return;
+  }
+  const n = changed.changes;
+  bannerTextEl.textContent = n > 1 ? `⟳ the document changed ${n} times` : '⟳ the document changed';
+  bannerEl.hidden = false;
+}
+
+/**
+ * Another screen cut a round while this one was reading.
+ *
+ * The document is not swapped here. Rounds exist so that what a comment attaches to
+ * moves when a person says so, and a screen rebuilt underneath somebody would take the
+ * reading position, the focus and anything half-typed with it. So it says what happened
+ * and leaves the click to them, while comments keep going to the round on screen.
+ */
+function renderMoved() {
+  const viewing = state.round?.n;
+  const behind = serverRound !== null && viewing !== undefined && serverRound !== viewing;
+  if (!behind || state.history) {
+    movedBarEl.hidden = true;
+    return;
+  }
+  movedTextEl.textContent =
+    `⟳ the round moved to R${String(serverRound).padStart(3, '0')} on another screen — ` +
+    `comments written here go to R${String(viewing).padStart(3, '0')}`;
+  movedBarEl.hidden = false;
+}
+
+/** True when another screen cut a round past the one this screen still shows. */
+function isBehind(): boolean {
+  return !state.history && serverRound !== null && state.round != null && serverRound !== state.round.n;
+}
+
+/**
+ * Take the answer to a resolve or a reply.
+ *
+ * The answer always carries the current round's comments. On a screen that is on the
+ * current round they replace the rail. On a screen another one moved past, they are not
+ * this screen's comments, and applying them put the newer round's rail beside the older
+ * document (#175). There only the one comment that changed is taken over, from the
+ * answer's `comment`, which is that comment as it now is. A carried one that is now
+ * resolved leaves the carried rail, as it does on a screen that is current.
+ */
+function takeAnswer(answer: CommentsPayload) {
+  if (!isBehind()) {
+    applyComments(answer);
+    return;
+  }
+  const fresh = answer.comment;
+  const comments = state.comments.map((x) => (x.id === fresh.id ? { ...x, ...fresh } : x));
+  const carried = state.carried.flatMap((x) =>
+    x.id !== fresh.id ? [x] : fresh.resolved ? [] : [{ ...x, ...fresh }],
+  );
+  applyComments({ ...answer, comments, carried });
+}
+
+/** The round the document on screen was read from, which is where a comment written on it goes. */
+function screenRound(): number | null {
+  return state.round?.viewing ?? state.round?.n ?? null;
+}
+
+/** True once the screen has moved to a round the draft's line numbers do not come from. */
+function draftIsStale(): boolean {
+  return draft?.round != null && screenRound() !== null && draft.round !== screenRound();
+}
+
+const STALE_DRAFT = 'the document on screen changed — pick the lines again (what is typed here is kept)';
+
+/**
+ * Say it on the bubble as soon as the document under it is replaced.
+ *
+ * Waiting for the person to press Comment would let them finish writing against lines
+ * that are not there any more. `startDraft` carries the text into the next selection,
+ * so picking a range again costs nothing.
+ */
+function noteStaleDraft() {
+  if (!draftIsStale()) return;
+  const box = anchoredEl.querySelector<HTMLElement>('.bubble.draft');
+  if (box) fail(box, STALE_DRAFT);
+}
+
+loadCurrentBtn.addEventListener('click', () => showCurrent());
+
+/**
+ * The bar's real height, published for the rules that sit under it.
+ *
+ * Two distances were written against a 41px bar: where the banner comes to rest, and how
+ * far below the top a jumped-to heading lands. The bar is 87px on a narrow screen, so the
+ * banner overlapped it and a heading jumped to from the outline landed underneath it.
+ * Neither could be fixed in CSS — a stylesheet cannot measure a height.
+ *
+ * Both are written as concrete pixels rather than a calc(). getPropertyValue hands back a
+ * custom property's *specified* value, so a calc() would arrive at the parseFloat in
+ * `currentHeading` as a string and become 0, quietly reporting the wrong section.
+ */
+const JUMP_CLEARANCE = 11;
+
+function publishBarHeight() {
+  const h = Math.round(topbarEl.getBoundingClientRect().height);
+  const root = document.documentElement.style;
+  root.setProperty('--ak-topbar-h', `${h}px`);
+  root.setProperty('--ak-jump-offset', `${h + JUMP_CLEARANCE}px`);
+}
+
+publishBarHeight();
+new ResizeObserver(publishBarHeight).observe(topbarEl);
+
+showLines.addEventListener('change', () => {
+  document.body.classList.toggle('show-lines', showLines.checked);
+});
+
+/**
+ * Light / dark, and the OS.
+ *
+ * The button is the only way to override the OS for this browser, so its label has to say
+ * which of the three states is in effect — an icon alone cannot distinguish "dark because
+ * I chose it" from "dark because the OS is". The cycle returns to `auto`, so an accidental
+ * press is undone by two more.
+ *
+ * The choice is per browser, not per instance: the origin is shared by every akapen on
+ * this host, which is what a reader expects from a preference about their own eyes.
+ */
+/**
+ * localStorage, or nothing.
+ *
+ * Reaching for `window.localStorage` throws outright on an origin the browser has blocked
+ * — not just reading from it — so the access itself has to be guarded.
+ */
+function themeStore(): ThemeStore | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function paintTheme(theme: Theme): void {
+  applyTheme(document.documentElement, theme);
+  themeToggleEl.textContent = theme;
+  themeToggleEl.title = `Theme: ${theme}. Click to change.`;
+}
+
+let theme: Theme = readTheme(themeStore());
+paintTheme(theme);
+
+themeToggleEl.addEventListener('click', () => {
+  theme = nextTheme(theme);
+  paintTheme(theme);
+  saveTheme(themeStore(), theme);
+});
+
+function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  cls?: string | null,
+  html?: string | null,
+): HTMLElementTagNameMap[K] {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (html != null) n.innerHTML = html;
+  return n;
+}
+
+function escapeHtml(s: string): string {
+  const table: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+  return s.replace(/[&<>"]/g, (m) => table[m] ?? m);
+}
+
+// Logging a failure to the console only makes it look, to the person who clicked, like nothing happened
+function fail(box: HTMLElement, message: string) {
+  box.querySelector('.bubble-error')?.remove();
+  box.append(el('div', 'bubble-error', escapeHtml(message)));
+  layoutRail();
+}
+
+function overlaps(block: Block, startLine: number, endLine: number): boolean {
+  return block.startLine <= endLine && block.endLine >= startLine;
+}
+
+/* ===== Document ===== */
+
+function renderDoc() {
+  const { doc, comments } = state;
+  if (!doc) return;
+  const fmLines = doc.blocks.filter((b) => b.kind === 'frontmatter');
+  const fmFirst = fmLines[0]?.startLine;
+  const fmLast = fmLines[fmLines.length - 1]?.startLine;
+
+  docEl.textContent = '';
+  for (const block of doc.blocks) {
+    const cls = ['row', block.kind, ...block.flags];
+    if (block.quoted) cls.push('quoted');
+    if (block.startLine === fmFirst) cls.push('fm-first');
+    if (block.startLine === fmLast) cls.push('fm-last');
+    // A range comment spans several lines, so mark every overlapping line as an anchor
+    const mine = comments.filter((c) => overlaps(block, c.startLine, c.endLine));
+    if (mine.length) cls.push('has-comment');
+
+    const row = el('div', cls.join(' '));
+    setLine(row, 'start', block.startLine);
+    setLine(row, 'end', block.endLine);
+    // Move DOM focus with j/k too. -1 keeps a hundred-odd rows out of the tab order;
+    // rows that carry a comment get 0 below so Tab can still reach them.
+    row.tabIndex = -1;
+
+    const gutter = el('div', 'gutter');
+    gutter.append(el('span', 'lineno', String(block.startLine)));
+    // While the rail is collapsed this marker is the only clue left
+    if (mine.length) gutter.append(makeMarker(mine));
+    const add = el('button', 'add', '+');
+    add.title = `comment on lines ${block.startLine}-${block.endLine}`;
+    add.addEventListener('click', (e) => {
+      e.stopPropagation();
+      drag = null;
+      focusLine = block.startLine;
+      sel = { start: block.startLine, end: block.endLine };
+      startDraft();
+    });
+    gutter.append(add);
+    row.append(gutter, el('div', 'body', block.html));
+    if (block.flags.includes('code-first')) row.append(copyButton(row));
+
+    gutter.addEventListener('mousedown', (e) => {
+      if (targetEl(e)?.classList.contains('marker')) return;
+      e.preventDefault();
+      drag = { start: block.startLine, end: block.endLine };
+      sel = { ...drag };
+      focusLine = block.startLine;
+      paintSelection();
+    });
+    row.addEventListener('mouseenter', () => {
+      if (!drag) return;
+      drag.end = block.endLine;
+      sel = { start: drag.start, end: drag.end };
+      paintSelection();
+    });
+    // The document can jump to a bubble as well (the link works both ways)
+    row.addEventListener('click', (e) => {
+      if (targetEl(e)?.closest('a, button')) return;
+      // A click feeds the same path as j/k. Without this, picking a row and pressing c
+      // still comments on the first line — mouse and keyboard drift apart.
+      focusLine = block.startLine;
+      sel = { start: block.startLine, end: block.endLine };
+      paintSelection();
+      const now = state.comments.find((c) => block.startLine <= c.endLine && block.endLine >= c.startLine);
+      if (now) setActive(now.id, 'rail');
+    });
+    if (mine.length) row.tabIndex = 0;
+
+    docEl.append(row);
+  }
+}
+
+/**
+ * Copy a fenced block without its fences (#168).
+ *
+ * A block is one row per source line, with nothing wrapping it, so a drag picks up the
+ * fence lines too. The text comes from the rendered code lines rather than the source,
+ * which inside a list or a quote carries the indent and the `>`.
+ */
+function copyButton(first: HTMLElement): HTMLElement {
+  const btn = el('button', 'copy-code', 'copy');
+  btn.title = 'copy the code without its fences';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const lines: string[] = [];
+    let previous = getLine(first, 'end');
+    for (let row = first.nextElementSibling; row?.classList.contains('code'); row = row.nextElementSibling) {
+      if (row.classList.contains('code-last') || row.classList.contains('code-first')) break;
+      // A fence left open ends at the last line of its content; a code row after a gap in
+      // the line numbers belongs to another block (an indented one).
+      if (getLine(row, 'start') !== previous + 1) break;
+      previous = getLine(row, 'end');
+      // An empty line is drawn as a non-breaking space so the row keeps its height.
+      lines.push((row.querySelector('.code-line')?.textContent ?? '').replace(/^\xa0$/, ''));
+    }
+    const ok = await copyText(lines.join('\n'));
+    btn.textContent = ok ? 'copied' : 'copy failed';
+    clearTimeout(reset);
+    reset = setTimeout(() => (btn.textContent = 'copy'), 1500);
+  });
+  let reset: ReturnType<typeof setTimeout> | undefined;
+  return btn;
+}
+
+/**
+ * The clipboard API exists only in a secure context, and akapen is usually read over
+ * plain http from another machine, so the old command is the path that normally runs.
+ */
+async function copyText(text: string): Promise<boolean> {
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      /* Denied; the command below may still be allowed. */
+    }
+  }
+  // Selecting the textarea takes focus; give it back, or the keyboard loses its place.
+  const focused = document.activeElement as HTMLElement | null;
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.append(area);
+  area.select();
+  // A browser that refuses can also throw; either way the textarea goes and focus returns.
+  try {
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    area.remove();
+    focused?.focus();
+  }
+}
+
+/** Repaint only the per-row marks for comments. The document DOM is not rebuilt. */
+function markCommentedRows() {
+  for (const row of docEl.querySelectorAll<HTMLElement>('.row')) {
+    const s = getLine(row, 'start');
+    const e = getLine(row, 'end');
+    const mine = state.comments.filter((c) => s <= c.endLine && e >= c.startLine);
+    row.classList.toggle('has-comment', mine.length > 0);
+    const gutter = row.querySelector<HTMLElement>('.gutter');
+    if (!gutter) continue;
+    const marker = gutter.querySelector<HTMLButtonElement>('.marker');
+    if (!mine.length) {
+      marker?.remove();
+    } else if (marker) {
+      marker.textContent = String(mine.length);
+      marker.title = `${mine.length} comments`;
+    } else {
+      gutter.insertBefore(makeMarker(mine), gutter.querySelector('.add'));
+    }
+  }
+}
+
+function updateCount() {
+  const open = state.comments.filter((c) => !c.resolved).length;
+  const carried = state.carried.length;
+  countEl.textContent = `${open} open / ${state.comments.length}${carried ? ` (+ ${carried} earlier)` : ''}`;
+}
+
+function makeMarker(mine: Comment[]): HTMLButtonElement {
+  const marker = el('button', 'marker', String(mine.length));
+  marker.title = `${mine.length} comments`;
+  marker.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openRail();
+    // Look the comment up again on click: rows are not rebuilt, so a captured array goes stale
+    const row = marker.closest('.row');
+    if (!row) return;
+    const s = getLine(row, 'start');
+    const e2 = getLine(row, 'end');
+    const now = state.comments.find((c) => s <= c.endLine && e2 >= c.startLine);
+    if (now) setActive(now.id, 'rail');
+  });
+  return marker;
+}
+
+function rowFor(line: number): HTMLElement | null {
+  const rows = [...docEl.querySelectorAll<HTMLElement>('.row')];
+  return (
+    rows.find((r) => getLine(r, 'start') <= line && line <= getLine(r, 'end')) ??
+    rows.find((r) => getLine(r, 'start') >= line) ??
+    rows.at(-1) ??
+    null
+  );
+}
+
+/* ===== Right rail ===== */
+
+function rangeLabel(startLine: number, endLine: number): string {
+  return `L${startLine}${endLine !== startLine ? `-${endLine}` : ''}`;
+}
+
+/** Keep a click inside the reply form from reaching the bubble, which navigates. */
+function stopClick(e: Event): void {
+  e.stopPropagation();
+}
+
+/**
+ * The thread under a comment: the replies, then a box to add one.
+ *
+ * One level. A reply cannot be replied to, so this is a list and not a tree — the
+ * exchange it carries is a person and an agent on one point, which does not branch.
+ *
+ * Replying is offered on a carried comment too. What a closed round freezes is the
+ * document and its line anchors, and "this could not be fixed, and here is why" is
+ * about work already handed over — the case that matters most.
+ */
+function repliesFor(c: Comment | RoundComment, past: boolean): HTMLElement {
+  const wrap = el('div', 'replies');
+  for (const r of c.replies ?? []) {
+    const item = el('div', `reply${r.authorKind === 'agent' ? ' from-agent' : ''}`);
+    const who = el('span', 'who', `@${escapeHtml(r.author)}`);
+    // Named, not just styled: colour alone would not survive a custom.css that drops it,
+    // and telling a person from an agent is the point once #12 lands.
+    if (r.authorKind === 'agent') who.append(el('span', 'kind', 'agent'));
+    // The first 8 characters, as `akapen list` prints them; the whole id is on hover for
+    // `claude --resume`.
+    if (r.sessionId !== undefined) {
+      const s = el('span', 'session', escapeHtml(r.sessionId.slice(0, 8)));
+      s.title = r.sessionId;
+      who.append(s);
+    }
+    item.append(who, el('div', 'reply-body', escapeHtml(r.body)));
+    wrap.append(item);
+  }
+
+  const form = el('div', 'reply-form');
+  const ta = el('textarea', 'reply-input');
+  ta.rows = 1;
+  ta.placeholder = 'reply';
+  const send = el('button', 'reply-send', 'Reply');
+  send.disabled = true;
+
+  const sync = () => {
+    send.disabled = ta.value.trim() === '';
+    // The bubble just changed height, so everything below it has to move.
+    layoutRail();
+  };
+  ta.addEventListener('input', sync);
+  // Clicking into the box must not count as clicking the bubble, which navigates.
+  ta.addEventListener('click', stopClick);
+  form.addEventListener('click', stopClick);
+
+  const submit = async () => {
+    const body = ta.value.trim();
+    if (!body || send.disabled) return;
+    send.disabled = true;
+    try {
+      const res = await fetch(`/api/comments/${c.id}/replies`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ body }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await decode(res, CommentsPayloadSchema);
+      ta.value = '';
+      // The response always carries the *current* round's comments, whichever round the
+      // parent was in. The history view cannot use them, since its bubbles are that
+      // round's own: applying them would swap the round on screen for the current one, so
+      // the round is opened again instead. Everywhere else `takeAnswer` decides.
+      if ((past || state.history) && state.round?.viewing) void showRound(state.round.viewing, c.id);
+      else takeAnswer(payload);
+    } catch (err) {
+      // Keep what was typed. Losing it leaves no way to get the words back.
+      send.disabled = false;
+      fail(form, `reply failed (${messageOf(err)})`);
+    }
+  };
+  send.addEventListener('click', (e) => {
+    e.stopPropagation();
+    void submit();
+  });
+  ta.addEventListener('keydown', (e) => {
+    // Same send key as a comment. Enter alone has to stay a newline.
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      void submit();
+    }
+  });
+
+  form.append(ta, send);
+  wrap.append(form);
+  return wrap;
+}
+
+function bubbleFor(c: Comment, opts?: { past?: false }): HTMLElement;
+function bubbleFor(c: RoundComment, opts: { past: true }): HTMLElement;
+function bubbleFor(c: Comment | RoundComment, opts: { past?: boolean } = {}): HTMLElement {
+  const box = el('div', `bubble${c.resolved ? ' resolved' : ''}${opts.past ? ' past' : ''}`);
+  box.dataset['id'] = c.id;
+  // The rail is rebuilt on every comments update; without this a reply just sent folded
+  // the bubble being read.
+  if (c.id === active) box.classList.add('active');
+  setLine(box, 'line', c.startLine);
+
+  const head = el('div', 'bubble-head');
+  head.append(el('span', 'who', `@${escapeHtml(c.author)}`));
+  if (opts.past) {
+    // Carry which round and which line this is about. Clicking jumps to the document as it was
+    const round = (c as RoundComment).round;
+    const tag = el('button', 'round-tag', `R${String(round).padStart(3, '0')}`);
+    tag.title = `view the document at R${String(round).padStart(3, '0')}`;
+    tag.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void showRound(round, c.id);
+    });
+    head.append(tag);
+  }
+  head.append(el('span', 'at', rangeLabel(c.startLine, c.endLine)));
+  const spacer = el('span', null, '');
+  spacer.style.flex = '1';
+  head.append(spacer);
+  const btn = el('button', null, c.resolved ? 'Reopen' : 'Resolve');
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    btn.disabled = true;
+    try {
+      const res = await fetch(`/api/comments/${c.id}/resolve`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!state.history) takeAnswer(await decode(res, CommentsPayloadSchema));
+      else if (state.round?.viewing) void showRound(state.round.viewing);
+    } catch (err) {
+      btn.disabled = false;
+      fail(box, `update failed (${messageOf(err)})`);
+    }
+  });
+  head.append(btn);
+
+  box.append(head, el('div', 'bubble-body', escapeHtml(c.body)));
+  box.append(repliesFor(c, opts.past === true));
+  // If only a mouse can expand the collapsed body, the keyboard cannot read past 12em
+  box.tabIndex = 0;
+  box.addEventListener('click', () => {
+    if (opts.past) void showRound((c as RoundComment).round, c.id);
+    else setActive(c.id, 'doc');
+  });
+  box.addEventListener('focus', () => setActive(c.id));
+  return box;
+}
+
+function draftBubble(): HTMLElement {
+  if (!draft) throw new Error('akapen: draftBubble called with no draft');
+  const { startLine, endLine, text } = draft;
+  const box = el('div', 'bubble draft');
+  box.dataset['id'] = 'draft';
+  setLine(box, 'line', startLine);
+  // send() closes over the range it was built with, so reuse must compare the end line
+  // too. Checking only the start line posts the old range after the selection grows.
+  setLine(box, 'end', endLine);
+
+  const head = el('div', 'bubble-head');
+  head.append(el('span', 'at', rangeLabel(startLine, endLine)));
+  const spacer = el('span', null, '');
+  spacer.style.flex = '1';
+  head.append(spacer);
+  box.append(head);
+
+  const ta = el('textarea');
+  ta.setAttribute('aria-label', `comment on ${rangeLabel(startLine, endLine)}`);
+  ta.placeholder = 'say what is wrong here…  (Ctrl+Enter to send)';
+  ta.value = text;
+  ta.addEventListener('input', () => {
+    if (draft) draft.text = ta.value;
+    layoutRail(); // typing changes the height, so push the bubbles below back down
+  });
+
+  const actions = el('div', 'bubble-actions');
+  const cancel = el('button', null, 'Cancel');
+  const submit = el('button', 'primary', 'Comment');
+  actions.append(cancel, submit);
+  box.append(ta, actions);
+
+  const close = () => {
+    draft = null;
+    active = null;
+    renderRail();
+    layoutRail();
+  };
+  let posted = null;
+  const send = async () => {
+    const body = ta.value.trim();
+    if (!body) return close();
+    if (submit.disabled) return; // hammering Ctrl+Enter must not post twice
+    // The range was read from the document that was on screen when this was opened. If a
+    // different one is on screen now, those numbers point at other text.
+    if (draftIsStale()) return fail(box, STALE_DRAFT);
+    submit.disabled = true;
+    try {
+      const res = await fetch('/api/comments', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // Which round these line numbers belong to, so the comment is filed there.
+        body: JSON.stringify({ startLine, endLine, body, round: draft?.round ?? undefined }),
+      });
+      if (!res.ok) throw await failureOf(res);
+      posted = await decode(res, CommentsPayloadSchema);
+    } catch (err) {
+      // Keep the draft. Discarding it leaves no way to get the typed text back
+      submit.disabled = false;
+      fail(box, `sending failed (${messageOf(err)})`);
+      return;
+    }
+    draft = null;
+    active = null;
+    // Collapse the selection but keep the line focus: jumping around ruins writing several in a row
+    sel = null;
+    paintSelection();
+    // The answer carries the current round's comments. They are this screen's only when the
+    // comment landed there; a screen on an earlier round keeps its own and adds this one.
+    const id = posted.comment.id;
+    if (posted.comments.some((c) => c.id === id)) applyComments(posted);
+    else applyComments({ ...posted, comments: [...state.comments, posted.comment], carried: state.carried });
+  };
+  cancel.addEventListener('click', close);
+  submit.addEventListener('click', send);
+  // Ctrl+Enter and Escape are not handled here. keys.ts' comment.submit and
+  // comment.cancel click the buttons below. Holding them in two places lets one of
+  // them skip the IME guard — which is exactly what happened.
+  return box;
+}
+
+/**
+ * The draft bubble is never rebuilt; it stays in the DOM.
+ *
+ * A textarea in the middle of an IME composition loses that composition the moment it
+ * leaves the DOM — detaching and reattaching counts, so we simply do not touch it.
+ * Focus and caret position survive for free as a result.
+ */
+function renderRail() {
+  for (const b of anchoredEl.querySelectorAll('.bubble:not(.draft)')) b.remove();
+
+  const existing = anchoredEl.querySelector<HTMLElement>('.bubble.draft');
+  if (!draft) {
+    existing?.remove();
+  } else if (
+    !existing ||
+    (existing as HTMLElement).dataset['line'] !== String(draft.startLine) ||
+    (existing as HTMLElement).dataset['end'] !== String(draft.endLine)
+  ) {
+    // Rebuild only when the range changed. No composition is in flight then, so removing it is safe
+    existing?.remove();
+    anchoredEl.append(draftBubble());
+  }
+
+  // Append in line order. Layout uses data-line so this does not affect drawing, but the
+  // tab order follows DOM order, and without matching it the keyboard jumps around.
+  for (const c of state.comments.toSorted((a, b) => a.startLine - b.startLine)) {
+    anchoredEl.append(bubbleFor(c));
+  }
+  renderCarried();
+}
+
+/**
+ * Unresolved comments from earlier rounds. They have no anchor in the current document,
+ * so they cannot be aligned. They are shown anyway because with nothing carrying over,
+ * "gone from the screen" would otherwise read as "dealt with".
+ */
+function renderCarried() {
+  carriedEl.textContent = '';
+  const carried = state.history ? [] : state.carried;
+  if (!carried.length) {
+    carriedEl.hidden = true;
+    return;
+  }
+  carriedEl.hidden = false;
+  const h = el('h2', null, `${carried.length} unresolved from earlier rounds`);
+  carriedEl.append(h);
+  for (const c of carried) carriedEl.append(bubbleFor(c, { past: true }));
+}
+
+/**
+ * Line each bubble up with its anchor row. Overlaps push down; the document never moves.
+ * Not inserting rows into the document is the whole point, so all the alignment is absorbed here.
+ *
+ * Reads (rect, offsetHeight) and writes (style.top) are kept apart. Interleaving them forces
+ * a synchronous layout per bubble, and this function runs on every keystroke in the textarea —
+ * on a long document that becomes visible.
+ */
+function layoutRail() {
+  // DOM order cannot be trusted because the draft never moves. Sort by anchor line first;
+  // out of order, "overlaps push down" means nothing.
+  const bubbles = [...anchoredEl.querySelectorAll<HTMLElement>('.bubble')].toSorted(
+    (a, b) => getLine(a, 'line') - getLine(b, 'line'),
+  );
+  if (!bubbles.length || document.body.classList.contains('rail-overlay')) {
+    for (const b of bubbles) b.style.top = '';
+    anchoredEl.style.height = '';
+    return;
+  }
+
+  // --- read ---
+  const rows = [...docEl.querySelectorAll<HTMLElement>('.row')].map((r) => ({
+    start: getLine(r, 'start'),
+    end: getLine(r, 'end'),
+    top: r.getBoundingClientRect().top,
+  }));
+  const railTop = anchoredEl.getBoundingClientRect().top;
+  const heights = bubbles.map((b) => b.offsetHeight);
+  const gap =
+    Number.parseInt(getComputedStyle(document.documentElement).getPropertyValue('--ak-bubble-gap'), 10) || 8;
+
+  // --- compute --- both are in line order, so one moving pointer over the rows is enough
+  const tops: number[] = [];
+  let cursor = 0;
+  let ri = 0;
+  for (const [i, b] of bubbles.entries()) {
+    const line = getLine(b, 'line');
+    while (ri < rows.length - 1 && (rows[ri]?.end ?? 0) < line) ri++;
+    const row = rows[ri];
+    const want = row ? row.top - railTop : cursor;
+    const top = Math.max(want, cursor);
+    tops.push(top);
+    cursor = top + (heights[i] ?? 0) + gap;
+  }
+
+  // --- write ---
+  for (const [i, b] of bubbles.entries()) b.style.top = `${tops[i] ?? 0}px`;
+  anchoredEl.style.height = `${cursor}px`;
+}
+
+function setActive(id: string, scroll?: 'doc' | 'rail') {
+  active = id;
+  for (const b of railEl.querySelectorAll<HTMLElement>('.bubble'))
+    b.classList.toggle('active', (b as HTMLElement).dataset['id'] === id);
+  const target = state.comments.find((c) => c.id === id) ?? (id === 'draft' ? draft : null);
+  for (const row of docEl.querySelectorAll<HTMLElement>('.row')) {
+    const s = getLine(row, 'start');
+    const e = getLine(row, 'end');
+    row.classList.toggle('linked', !!target && s <= target.endLine && e >= target.startLine);
+  }
+  // `active` un-collapses .bubble-body and .reply-body, so the height changes. Re-run the alignment
+  layoutRail();
+  if (!target) return;
+  if (scroll === 'doc') rowFor(target.startLine)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  if (scroll === 'rail') {
+    railEl
+      .querySelector(`.bubble[data-id="${id}"]`)
+      ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+/* ===== Collapsed state (when there is not enough width) ===== */
+
+// A collapsed rail only moves off-screen; it stays in the DOM. Forget to set inert and
+// Tab walks into buttons nobody can see, and focus becomes impossible to locate.
+function openRail() {
+  if (!document.body.classList.contains('rail-overlay')) return;
+  document.body.classList.add('rail-open');
+  railEl.inert = false;
+}
+railCloseEl.addEventListener('click', () => {
+  document.body.classList.remove('rail-open');
+  railEl.inert = true;
+});
+
+// The same condition as @media (max-width: 1199px) in style.css. Written separately, a
+// fractional width like 1199.5px makes CSS and JS disagree and every bubble stacks up.
+const railOverlayQuery = window.matchMedia('(max-width: 1199px)');
+
+function syncRailMode() {
+  const overlay = railOverlayQuery.matches;
+  document.body.classList.toggle('rail-overlay', overlay);
+  if (!overlay) document.body.classList.remove('rail-open');
+  railEl.inert = overlay && !document.body.classList.contains('rail-open');
+}
+
+/* ===== Selection and the form ===== */
+/* Mouse and keyboard both move `sel` and call startDraft. One entry point. */
+
+function paintSelection() {
+  const lo = sel ? Math.min(sel.start, sel.end) : null;
+  const hi = sel ? Math.max(sel.start, sel.end) : null;
+  for (const row of docEl.querySelectorAll<HTMLElement>('.row')) {
+    const s = getLine(row, 'start');
+    row.classList.toggle('in-range', lo !== null && hi !== null && s >= lo && s <= hi);
+    row.classList.toggle('focused', s === focusLine);
+  }
+}
+
+function clearSelection() {
+  sel = null;
+  paintSelection();
+}
+
+function startDraft(): void {
+  if (!sel) return;
+  const lo = Math.min(sel.start, sel.end);
+  const hi = Math.max(sel.start, sel.end);
+  draft = { startLine: lo, endLine: hi, text: draft?.text ?? '', round: screenRound() };
+  // The document is untouched. Opening a draft happens inside the rail
+  renderRail();
+  layoutRail();
+  openRail();
+  setActive('draft');
+  railEl.querySelector<HTMLTextAreaElement>('.bubble.draft textarea')?.focus();
+}
+
+document.addEventListener('mouseup', () => {
+  if (!drag) return;
+  drag = null;
+  startDraft();
+});
+
+/* ===== Line focus (the keyboard path) ===== */
+
+function lineNumbers() {
+  return [...docEl.querySelectorAll('.row')].map((r) => getLine(r, 'start'));
+}
+
+/** Move `step` rows. With `extend`, grow the selection; otherwise collapse it to one line. */
+function moveFocus(step: number, extend: boolean) {
+  const lines = lineNumbers();
+  if (!lines.length) return;
+  const first = lines[0];
+  if (first === undefined) return;
+  if (focusLine === null) {
+    focusLine = first;
+  } else {
+    const i = lines.indexOf(focusLine);
+    const next = i < 0 ? 0 : Math.min(Math.max(i + step, 0), lines.length - 1);
+    focusLine = lines[next] ?? first;
+  }
+  const anchor = extend && sel ? sel.start : focusLine;
+  sel = { start: anchor, end: focusLine };
+  paintSelection();
+  const row = docEl.querySelector<HTMLElement>(`.row[data-start="${focusLine}"]`);
+  row?.scrollIntoView({ block: 'nearest' });
+  row?.focus({ preventScroll: true });
+}
+
+/* ===== Rendering ===== */
+
+/**
+ * A re-render rebuilds the rail, so the draft textarea becomes a different element.
+ * Carrying the text alone is not enough: losing focus and the caret stops you mid-sentence.
+ * A doc payload also arrives when another client posts or resolves, so this happens with
+ * nothing to do with what you did.
+ */
+function captureFocus(): { start: number; end: number } | null {
+  const ta = railEl.querySelector<HTMLTextAreaElement>('.bubble.draft textarea');
+  if (!ta || document.activeElement !== ta) return null;
+  return { start: ta.selectionStart, end: ta.selectionEnd };
+}
+
+function restoreFocus(saved: { start: number; end: number } | null) {
+  if (!saved) return;
+  const ta = railEl.querySelector<HTMLTextAreaElement>('.bubble.draft textarea');
+  if (!ta) return;
+  ta.focus({ preventScroll: true });
+  ta.setSelectionRange(saved.start, saved.end);
+}
+
+function render() {
+  const { doc } = state;
+  if (!doc) return;
+  const focus = captureFocus();
+  filePathEl.textContent = doc.path;
+  // The path is truncated to keep the bar on one line, so the whole of it lives here
+  filePathEl.title = doc.path;
+  // Several reviews are open at once, one per note, and the tab is the only place they
+  // are told apart before being clicked.
+  document.title = pageTitle(doc);
+  renderRoundControls();
+  updateCount();
+
+  renderDoc();
+  renderOutline();
+  paintSelection();
+  renderRail();
+  if (active) setActive(active);
+  else layoutRail();
+  restoreFocus(focus);
+  renderMermaid();
+}
+
+async function renderMermaid() {
+  const nodes = docEl.querySelectorAll('pre.mermaid');
+  if (!nodes.length) return;
+  if (!mermaidLib) {
+    // Points at build output. With no diagram in the document it is never fetched.
+    // The URL is assembled at runtime so the bundler does not resolve it.
+    const url = '/mermaid.js';
+    const mod = (await import(/* @vite-ignore */ url)) as { default: MermaidLib };
+    mermaidLib = mod.default;
+    mermaidLib.initialize({
+      startOnLoad: false,
+      theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
+    });
+  }
+  await mermaidLib.run({ nodes });
+  layoutRail(); // drawing a diagram changes the document height, so always realign
+}
+
+/* ===== Enlarging a figure ===== */
+
+const zoomEl = must<HTMLDialogElement>('zoom');
+
+// A wide diagram is shrunk to the sheet until its labels cannot be read, and fitting it
+// to the window instead is not enough: a 20-node LR chart only grows from 0.2x to 0.3x.
+// So a diagram's copy is shown at its own size and scrolls. An image is fitted to the
+// window instead and never enlarged: at its own size a photo or a retina screenshot opens
+// on its top-left corner.
+
+/** What can be enlarged: an image not inside a link, and a diagram's own svg (not an icon svg some diagram types nest inside it). */
+const FIGURE = '.body img:not(a img), pre.mermaid > svg';
+
+/** The mouse and the `figure.zoom` key both come here, so the two cannot diverge. */
+function openZoom(fig: Element) {
+  // The copy keeps mermaid's ids, so they are duplicated while it is open. Its styles
+  // (#id .node) and arrowheads (url(#id-…)) need them; the dialog sits before #doc, so
+  // they resolve to the copy itself, and both are the same drawing anyway.
+  const copy = fig.cloneNode(true) as Element;
+  const box = copy instanceof SVGSVGElement ? copy.viewBox.baseVal : null;
+  if (box?.width) {
+    copy.setAttribute('width', String(box.width));
+    copy.setAttribute('height', String(box.height));
+  }
+  zoomEl.replaceChildren(copy);
+  zoomEl.showModal();
+  // showModal focuses the first link in a diagram (a mermaid `click` node), which scrolls
+  // the copy over to that node; Chromium ignores autofocus on the dialog itself. Open on
+  // the start of the figure instead.
+  zoomEl.focus();
+  zoomEl.scrollTo(0, 0);
+}
+
+// Capture phase, and the click stops here: the row's own handler would otherwise select
+// the row and jump the rail, which is not what enlarging a figure asks for.
+docEl.addEventListener(
+  'click',
+  (e) => {
+    // Not targetEl: a click on a diagram's shape lands on an SVG <path> or <rect>, which is
+    // not an HTMLElement (its label is an HTML span inside a foreignObject).
+    // A link is left to the link. FIGURE already leaves out an image inside one; this catches
+    // a mermaid node with a `click` href, which sits inside the diagram's svg.
+    const at = e.target instanceof Element ? e.target : null;
+    const fig = at?.closest(FIGURE);
+    if (!fig || at?.closest('a')) return;
+    e.stopPropagation();
+    openZoom(fig);
+  },
+  true,
+);
+// A press on the overlay's scrollbar scrolls without firing click (measured in Chromium and
+// Firefox with classic scrollbars), so any click can mean "close".
+zoomEl.addEventListener('click', () => zoomEl.close());
+// Every key stops here. keys.ts calls preventDefault on Escape (comment.cancel), which
+// would keep the dialog from closing at all, and j/k would move the selection behind it.
+zoomEl.addEventListener('keydown', (e) => e.stopPropagation());
+zoomEl.addEventListener('close', () => zoomEl.replaceChildren());
+
+// Realign whenever the document height changes (images, fonts, wrapping width)
+new ResizeObserver(() => layoutRail()).observe(docEl);
+railOverlayQuery.addEventListener('change', () => {
+  syncRailMode();
+  layoutRail();
+});
+window.addEventListener('resize', () => layoutRail());
+
+syncRailMode();
+
+/* ===== Switching rounds (history) ===== */
+
+/**
+ * Show a past round: the document and comments exactly as they were.
+ * Comments written here are filed on that round.
+ */
+async function showRound(n: number, focusId?: string) {
+  try {
+    const res = await fetch(`/api/doc?round=${n}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await decode(res, DocPayloadSchema);
+    draft = null;
+    sel = null;
+    focusLine = null;
+    active = focusId ?? null;
+    applyPayload(payload);
+    if (focusId) setActive(focusId, 'doc');
+  } catch (err) {
+    historyTextEl.textContent = `could not open the round (${messageOf(err)})`;
+    historyBarEl.hidden = false;
+  }
+}
+
+async function showCurrent() {
+  try {
+    const res = await fetch('/api/doc');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = await decode(res, DocPayloadSchema);
+    active = null;
+    applyPayload(payload);
+  } catch (err) {
+    // Returning quietly would make the back button look dead. Keep what is on screen —
+    // it is still the round the person was reading — and say why it did not move.
+    historyTextEl.textContent = `could not leave history (${messageOf(err)})`;
+    historyBarEl.hidden = false;
+  }
+}
+
+backBtn.addEventListener('click', () => showCurrent());
+roundPickEl.addEventListener('change', () => {
+  const n = Number(roundPickEl.value);
+  if (n === state.round?.n) showCurrent();
+  else showRound(n);
+});
+
+function renderRoundControls() {
+  const round = state.round;
+  if (!round) return;
+  const viewing = round.viewing ?? round.n;
+  roundEl.textContent = `R${String(viewing).padStart(3, '0')}`;
+
+  const rounds = round.all ?? [];
+  const want = rounds.map((r) => r.n).join(',');
+  if (roundPickEl.dataset['rounds'] !== want) {
+    roundPickEl.textContent = '';
+    for (const r of rounds) {
+      const o = el('option', null, `R${String(r.n).padStart(3, '0')}${r.n === round.n ? ' (current)' : ''}`);
+      o.value = String(r.n);
+      roundPickEl.append(o);
+    }
+    roundPickEl.dataset['rounds'] = want;
+  }
+  roundPickEl.value = String(viewing);
+  roundPickEl.hidden = rounds.length < 2;
+
+  document.body.classList.toggle('viewing-history', state.history);
+  historyBarEl.hidden = !state.history;
+  if (state.history) {
+    historyTextEl.textContent = `viewing the document as it was at R${String(viewing).padStart(3, '0')} — comments written here go to it`;
+  }
+}
+
+/* ===== The outline ===== */
+
+/**
+ * The document's headings, hanging from the header.
+ *
+ * A column of its own would be the better place to read one from, and there is no room:
+ * the columns are meant to be source, document and comments, left to right (#76). What
+ * a permanently visible column gives away for free is where you are, so a panel has to
+ * answer that the moment it opens — which is what markCurrent is for.
+ *
+ * Nothing here asks the server anything. Every heading, its level and its line are
+ * already on the blocks the document was drawn from.
+ */
+const DEEPEST_KEY = 'akapen.outline.deepest';
+
+/**
+ * How deep this reader wants the outline. Stored per browser: it is a preference, and
+ * the document has no opinion about it.
+ */
+function readDeepest(): number {
+  try {
+    return Number(localStorage.getItem(DEEPEST_KEY)) === DEEPEST_LEVEL ? DEEPEST_LEVEL : DEFAULT_DEEPEST;
+  } catch {
+    // Storage can be denied outright. That is worth the default depth, not a dead outline.
+    return DEFAULT_DEEPEST;
+  }
+}
+
+let deepest = readDeepest();
+
+const outlineOpen = (): boolean => !outlineEl.hidden;
+
+function setOutlineOpen(open: boolean) {
+  outlineEl.hidden = !open;
+  outlineToggleEl.setAttribute('aria-expanded', String(open));
+}
+
+function closeOutline() {
+  setOutlineOpen(false);
+}
+
+function outlineRow(entry: OutlineEntry): HTMLButtonElement {
+  const row = el('button', 'outline-entry', escapeHtml(entry.text));
+  row.type = 'button';
+  // The written level styles the row; the depth in the tree indents it. They disagree
+  // wherever the document skips a level, and each is being used for what it means.
+  row.dataset['level'] = String(entry.level);
+  row.style.setProperty('--depth', String(entry.depth));
+  setLine(row, 'start', entry.line);
+  row.addEventListener('click', () => goToHeading(entry.line));
+  return row;
+}
+
+function renderOutline() {
+  const doc = state.doc;
+  outlineListEl.textContent = '';
+
+  const total = doc ? headingCount(doc) : 0;
+  // A document with no headings has no outline to open, so the control goes away rather
+  // than opening on nothing. The same shape the switcher takes when nothing else is running.
+  outlineToggleEl.hidden = total === 0;
+  if (total === 0) {
+    closeOutline();
+    return;
+  }
+
+  const entries = doc ? flattenOutline(buildOutline(doc, deepest)) : [];
+  for (const entry of entries) outlineListEl.append(outlineRow(entry));
+
+  // Every heading is deeper than the depth in force — a note written entirely in h4s.
+  // Saying so beats an empty panel, and what reaches them is the line underneath.
+  const hiddenCount = total - entries.length;
+  outlineEmptyEl.hidden = entries.length > 0;
+  outlineEmptyEl.textContent = `${hiddenCount} heading${hiddenCount === 1 ? '' : 's'}, all of them deeper than h${deepest}`;
+
+  if (outlineOpen()) markCurrent();
+}
+
+/**
+ * Mark the heading the reader is under.
+ *
+ * Taken when the panel opens and not before. A shut panel cannot be read, so watching
+ * the scroll while it is shut is work nobody ever sees.
+ *
+ * The last heading at or above the header is the one whose section is being read. When
+ * none is — the frontmatter, or an introduction above the first heading — the first row
+ * is marked, because that is the section the reader is about to be in.
+ */
+function markCurrent() {
+  const rows = [...outlineListEl.querySelectorAll<HTMLElement>('.outline-entry')];
+  // Where a jump puts a heading, read from the one place that distance is written. Take
+  // anything shorter and the heading just jumped to sits below the line, so coming back
+  // into the panel would report the section before it.
+  const offset = getComputedStyle(document.documentElement).getPropertyValue('--ak-jump-offset');
+  const edge = (Number.parseFloat(offset) || 0) + 1;
+  let current: HTMLElement | null = null;
+  for (const row of rows) {
+    const target = rowFor(getLine(row, 'start'));
+    if (target && target.getBoundingClientRect().top <= edge) current = row;
+  }
+  current ??= rows[0] ?? null;
+  for (const row of rows) row.classList.toggle('current', row === current);
+  current?.scrollIntoView({ block: 'nearest' });
+}
+
+function goToHeading(line: number) {
+  closeOutline();
+  const row = rowFor(line);
+  if (!row) return;
+  // The state a click on the row itself would leave. Without it, pressing c after a jump
+  // comments on wherever the focus was before — the mouse and the keyboard drifting apart.
+  focusLine = line;
+  sel = { start: line, end: getLine(row, 'end') };
+  paintSelection();
+  row.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+function toggleOutline() {
+  if (outlineOpen()) {
+    closeOutline();
+    return;
+  }
+  if (outlineToggleEl.hidden) return;
+  // Both panels hang from the same edge of the header, so they would sit on top of each other
+  closePeers();
+  setOutlineOpen(true);
+  markCurrent();
+}
+
+outlineToggleEl.addEventListener('click', (e) => {
+  // The document-wide handler below would otherwise close it in the same click
+  e.stopPropagation();
+  toggleOutline();
+});
+
+document.addEventListener('click', (e) => {
+  if (!outlineOpen()) return;
+  const target = targetEl(e);
+  if (target && (outlineEl.contains(target) || outlineToggleEl.contains(target))) return;
+  closeOutline();
+});
+
+outlineDeepEl.checked = deepest === DEEPEST_LEVEL;
+outlineDeepEl.addEventListener('change', () => {
+  deepest = outlineDeepEl.checked ? DEEPEST_LEVEL : DEFAULT_DEEPEST;
+  try {
+    localStorage.setItem(DEEPEST_KEY, String(deepest));
+  } catch {
+    // A denied write costs the preference on the next visit, not the outline on this one
+  }
+  renderOutline();
+});
+
+/* ===== Other akapen on this host ===== */
+
+/**
+ * The other instances running beside this one.
+ *
+ * The list is built by our own server, which asks each of them in turn. The browser
+ * cannot: every instance is a different origin, so it would need CORS on an endpoint
+ * that has none, and one bound to 127.0.0.1 is not reachable from here at all while
+ * being perfectly reachable from the server sitting next to it.
+ */
+let peers: InstancePeer[] = [];
+
+const peersOpen = (): boolean => !peersEl.hidden;
+
+function setPeersOpen(open: boolean) {
+  peersEl.hidden = !open;
+  peersToggleEl.setAttribute('aria-expanded', String(open));
+}
+
+/**
+ * Opening is asynchronous — the list is refreshed on the way — so anything that closes
+ * it has to cancel a request that is still in flight rather than let it land later.
+ * Without this, pressing Escape straight after `o` leaves the panel opening by itself
+ * once the earlier request answers, which is nothing the person asked for.
+ */
+let peersRequest = 0;
+
+function closePeers() {
+  peersRequest++;
+  setPeersOpen(false);
+}
+
+/**
+ * Built from the address this page was opened on, not from the one the peer bound.
+ * The browser is usually not on that host — akapen is started with `--host 0.0.0.0`
+ * and read over the LAN — so `localhost` and `127.0.0.1` point at the reader's own
+ * machine. A peer that took the default loopback bind gets no link at all; it is
+ * listed anyway, because where an unreachable review is running is worth knowing.
+ */
+function peerUrl(peer: InstancePeer): string {
+  return `${location.protocol}//${location.hostname}:${peer.port}/`;
+}
+
+function renderPeers() {
+  peersToggleEl.hidden = peers.length === 0;
+  peersToggleEl.textContent = `\u21c4 ${peers.length} ${peers.length === 1 ? 'other' : 'others'}`;
+  if (peers.length === 0) setPeersOpen(false);
+
+  peersListEl.textContent = '';
+  for (const peer of peers) {
+    const row = el('li', 'peer');
+    if (peer.reachable) {
+      const link = el('a', 'peer-file', escapeHtml(peer.file));
+      link.href = peerUrl(peer);
+      row.append(link);
+    } else {
+      row.append(el('span', 'peer-file', escapeHtml(peer.file)));
+    }
+    row.append(el('span', 'peer-round', `R${String(peer.round).padStart(3, '0')}`));
+    // Whether it is waiting on you is the reason to look at this list at all
+    const waiting = peer.unresolved > 0 ? ' waiting' : '';
+    row.append(el('span', `peer-unresolved${waiting}`, `${peer.unresolved} unresolved`));
+    if (!peer.reachable) {
+      const mark = el('span', 'peer-unreachable', 'not reachable');
+      mark.title = `bound to ${escapeHtml(peer.host)}, so only that host can open it`;
+      row.append(mark);
+    }
+    peersListEl.append(row);
+  }
+}
+
+async function loadPeers(): Promise<void> {
+  try {
+    const res = await fetch('/api/instances');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    peers = (await decode(res, InstancesPayloadSchema)).instances;
+  } catch {
+    // Nothing being read depends on this. A failed request costs the switcher and
+    // says so by the button disappearing, which is also what "none are running" looks
+    // like — the two are the same thing to someone trying to get to another review.
+    peers = [];
+  }
+  renderPeers();
+}
+
+async function togglePeers(): Promise<void> {
+  if (peersOpen()) {
+    closePeers();
+    return;
+  }
+  const request = ++peersRequest;
+  closeOutline();
+  // Refreshed on the way open. An instance that stopped an hour ago must not be a row
+  // that is still there to be clicked.
+  await loadPeers();
+  // Closed, or pressed again, while this was in flight. The press that comes after wins.
+  if (request !== peersRequest) return;
+  if (peers.length > 0) setPeersOpen(true);
+}
+
+peersToggleEl.addEventListener('click', (e) => {
+  // The document-wide handler below would otherwise close it in the same click
+  e.stopPropagation();
+  void togglePeers();
+});
+
+document.addEventListener('click', (e) => {
+  if (!peersOpen()) return;
+  const target = targetEl(e);
+  if (target && (peersEl.contains(target) || peersToggleEl.contains(target))) return;
+  closePeers();
+});
+
+// Instances start and stop while this page is open, and coming back to the tab is when
+// that is most likely to have happened. One request, and only when the tab is looked at.
+window.addEventListener('focus', () => void loadPeers());
+
+/* ===== Keymap =====
+ * The bindings live in web/keys.ts; this holds only the actions themselves.
+ * They call the same functions the mouse path does (startDraft, setActive) so the
+ * two never fork.
+ */
+/** Returning false leaves the browser default alone (keys.ts' contract). */
+const ACTIONS: Record<string, () => boolean | void> = {
+  'row.next': () => moveFocus(1, false),
+  'row.prev': () => moveFocus(-1, false),
+  'row.extendNext': () => moveFocus(1, true),
+  'row.extendPrev': () => moveFocus(-1, true),
+  'comment.start': () => {
+    if (focusLine === null) moveFocus(0, false);
+    if (!sel) return false;
+    startDraft();
+    return undefined;
+  },
+  'comment.submit': () => {
+    const btn = railEl.querySelector<HTMLButtonElement>('.bubble.draft button.primary');
+    if (!btn) return false; // outside an editor, do not get in the way
+    btn.click();
+    return undefined;
+  },
+  'comment.cancel': () => {
+    // A panel from the header first: it is the thing most recently opened over everything
+    // else. Closing covers a switcher that is still opening as well — letting that request
+    // land would reopen what this key press just dismissed. The key is only consumed when
+    // a panel was really open, so Escape goes on meaning "cancel the draft" the rest of
+    // the time.
+    const panelWasOpen = peersOpen() || outlineOpen();
+    closePeers();
+    closeOutline();
+    if (panelWasOpen) return undefined;
+    const btn = railEl.querySelector<HTMLButtonElement>('.bubble.draft button:not(.primary)');
+    if (btn) btn.click();
+    else if (document.body.classList.contains('rail-open')) railCloseEl.click();
+    else if (sel) clearSelection();
+    else return false;
+    return undefined;
+  },
+  'lines.toggle': () => {
+    showLines.checked = !showLines.checked;
+    showLines.dispatchEvent(new Event('change'));
+  },
+  // The same path the button takes, so the two cannot diverge (W-2)
+  'instances.toggle': () => {
+    void togglePeers();
+  },
+  'outline.toggle': () => {
+    toggleOutline();
+  },
+  // The first figure on the focused line, opened the way a click opens it
+  'figure.zoom': () => {
+    const row = docEl.querySelector<HTMLElement>(`.row[data-start="${focusLine}"]`);
+    const fig = row?.querySelector(FIGURE);
+    if (!fig) return false;
+    openZoom(fig);
+    return undefined;
+  },
+};
+
+loadKeymap().then((keymap) => bindKeys(keymap, ACTIONS));
+
+function applyPayload(payload: DocPayload) {
+  const y = window.scrollY;
+  state = {
+    doc: payload.doc,
+    comments: payload.comments,
+    round: payload.round,
+    carried: payload.carried ?? [],
+    history: !!payload.history,
+  };
+  // Every payload carries which round is current, history included. Reading it here is
+  // what clears the notice once the screen has caught up.
+  noteServerRound(payload.round.n);
+  render();
+  renderBanner(state.history ? null : payload.changed);
+  renderMoved();
+  noteStaleDraft();
+  window.scrollTo(0, y);
+}
+
+// The first render fetches the document once, here. After that the document DOM is
+// rebuilt only when a round is cut or history is opened — both things a person did.
+async function boot() {
+  try {
+    const res = await fetch('/api/doc');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    applyPayload(await decode(res, DocPayloadSchema));
+    // Separate from the document: whether another review is running says nothing about
+    // this one, and waiting on that answer would hold up the first render.
+    void loadPeers();
+  } catch (err) {
+    // There is nothing on screen yet, so a silent return leaves a blank page with no
+    // way to tell a slow load from a dead server.
+    bannerTextEl.textContent = `could not load the document (${messageOf(err)})`;
+    bannerEl.hidden = false;
+  }
+}
+
+/**
+ * SSE delivers notifications only. Rebuilding the screen here would destroy the reading
+ * position, the focused input, an in-flight IME composition and the text selection —
+ * none of it caused by anything the person did.
+ */
+const sse = new EventSource('/events');
+sse.addEventListener('message', (e) => {
+  // An event arrives outside any request, so a throw here has nobody to catch it.
+  // A payload we cannot read is dropped: the next one, or the next /api/doc, recovers.
+  // JSON.parse has to be inside the guard — it runs while building safeParse's argument,
+  // so a non-JSON event would throw before any of the checking happens.
+  let data: unknown;
+  try {
+    data = JSON.parse(e.data);
+  } catch {
+    return;
+  }
+  const parsed = v.safeParse(ServerEventSchema, data);
+  if (!parsed.success) return;
+  if (parsed.output.type === 'round') {
+    // Only the number. Swapping the document from here would rebuild a screen nobody
+    // touched, which is the thing rounds are for avoiding.
+    noteServerRound(parsed.output.n);
+    renderMoved();
+    return;
+  }
+  if (!state.history) renderBanner(parsed.output);
+});
+
+boot();

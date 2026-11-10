@@ -1,0 +1,13 @@
+/* An example stylesheet. akapen always loads /custom.css last, so every default can be
+   overridden. With crit this took a browser extension; here it is one --css flag. */
+:root {
+  --ak-content-width: 1080px;
+  --ak-line-height: 1.5;
+  --ak-block-gap: 1px;
+  --ak-para-gap: 3px;
+}
+/* Space above a heading goes through --ak-heading-above, so the gutter keeps level with it.
+   The default sheet's 6px under another heading and 0 on the first row still win over this. */
+.row.heading { --ak-heading-above: 12px; }
+.body h1, .body h2, .body h3, .body h4, .body h5, .body h6 { margin-bottom: 3px; }
+.split-table td, .split-table th { padding: 3px 8px; font-size: 0.88rem; }

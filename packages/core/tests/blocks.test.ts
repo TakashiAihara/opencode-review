@@ -1,0 +1,236 @@
+/**
+ * Line-mapping invariants.
+ *
+ * Break them and you get the worst failure there is: the line you want to point at
+ * is not on the screen. This is what akapen stands on, so it comes before looks.
+ */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { buildDoc } from '../src/blocks.ts';
+
+// The repository's own sample, not a copy: it is the file the README tells you to open,
+// so a split that breaks on it breaks the first thing anyone sees.
+const FIXTURE = join(import.meta.dirname, '..', '..', '..', 'examples', 'sample.md');
+const source = readFileSync(FIXTURE, 'utf8');
+const lines = source.split('\n');
+const doc = buildDoc(FIXTURE, source);
+
+describe('frontmatter', () => {
+  const fm = doc.blocks.filter((b) => b.kind === 'frontmatter');
+
+  it('splits into one block per source line', () => {
+    expect(fm.length).toBeGreaterThan(0);
+    expect(fm.every((b) => b.startLine === b.endLine)).toBe(true);
+  });
+
+  it('lets a single key: value line be addressed', () => {
+    expect(fm.find((b) => b.text.startsWith('title:'))).toBeDefined();
+    expect(fm.find((b) => b.text.trim().startsWith('status:'))).toBeDefined();
+  });
+
+  it('leaves the source untouched (typographer does not mangle quotes)', () => {
+    const title = fm.find((b) => b.text.startsWith('title:'))!;
+    expect(title.text).toBe(lines[title.startLine - 1]);
+  });
+});
+
+describe('line coverage', () => {
+  const coverage = new Map<number, number>();
+  for (const b of doc.blocks) {
+    for (let ln = b.startLine; ln <= b.endLine; ln++) coverage.set(ln, (coverage.get(ln) ?? 0) + 1);
+  }
+
+  it('never puts one line in two blocks', () => {
+    expect([...coverage.entries()].filter(([, n]) => n > 1).map(([ln]) => ln)).toEqual([]);
+  });
+
+  it('puts every non-blank line in some block', () => {
+    const missing: number[] = [];
+    for (let ln = 1; ln <= lines.length; ln++) {
+      if (!lines[ln - 1]!.trim()) continue; // blank lines get no row, by design
+      if (!coverage.has(ln)) missing.push(ln);
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it('keeps blocks in line order', () => {
+    expect(doc.blocks.filter((b, i) => i > 0 && b.startLine < doc.blocks[i - 1]!.startLine)).toEqual([]);
+  });
+
+  it('keeps each block text equal to its source lines', () => {
+    const mismatched = doc.blocks.filter(
+      (b) => b.kind !== 'frontmatter' && b.text !== lines.slice(b.startLine - 1, b.endLine).join('\n'),
+    );
+    expect(mismatched.map((b) => b.startLine)).toEqual([]);
+  });
+});
+
+describe('structure', () => {
+  it('splits table rows without dropping columns', () => {
+    const rows = doc.blocks.filter((b) => b.kind === 'table-row' && !b.flags.includes('table-separator'));
+    expect(rows.length).toBeGreaterThan(0);
+    const counts = new Set(rows.map((b) => (b.html.match(/<t[dh][ >]/g) ?? []).length));
+    expect(counts.has(0)).toBe(false);
+  });
+
+  it('splits nested list items with their depth', () => {
+    expect(doc.blocks.filter((b) => b.kind === 'list-item' && b.depth > 0).length).toBeGreaterThan(0);
+  });
+});
+
+const kindsOf = (md: string) => [...new Set(buildDoc('t.md', md).blocks.map((b) => b.kind))];
+
+/** A fenced block with the given info string, holding something mermaid can draw. */
+const fence = (info: string) => `\`\`\`${info}\ngraph TD\n  A-->B\n\`\`\``;
+
+describe('fence info strings', () => {
+  it.each([['mermaid'], ['Mermaid'], ['MERMAID'], ['mermaid title="x"'], ['Mermaid  title="x"']])(
+    'renders ```%s as a diagram',
+    (info) => {
+      // A language name is case-insensitive to anyone writing markdown. Comparing the raw
+      // string made a capitalised fence come out as an ordinary code block, with nothing
+      // said about why — it just was not a diagram.
+      expect(kindsOf(fence(info))).toEqual(['mermaid']);
+    },
+  );
+
+  it.each([['ts'], ['TypeScript'], [''], ['mermaidjs'], ['not-mermaid']])('leaves ```%s as code', (info) => {
+    // Only the whole first word counts. A fence that merely starts with the letters
+    // must not be swallowed.
+    expect(kindsOf(fence(info))).toEqual(['code']);
+  });
+
+  it('highlights a language whatever case it is written in', () => {
+    // hljs.getLanguage folds case itself, so this is a guard rather than a fix.
+    const upper = buildDoc('t.md', '```TypeScript\nconst a: number = 1;\n```');
+    const lower = buildDoc('t.md', '```typescript\nconst a: number = 1;\n```');
+    expect(upper.blocks.some((b) => b.html.includes('hljs-'))).toBe(true);
+    expect(upper.blocks.map((b) => b.html.replace(/TypeScript/g, 'typescript'))).toEqual(
+      lower.blocks.map((b) => b.html),
+    );
+  });
+});
+
+/**
+ * `plainText` (packages/shared/src/inline-text.ts) ends a tag at the first `>` without
+ * tracking quotes, so a raw one inside an attribute would cut a tab title and an
+ * outline row off mid-heading. Nothing on the browser side checks for that. What
+ * rules it out is `html: false` here, which nothing else was holding in place.
+ */
+describe('attribute values', () => {
+  const CASES = [
+    '# a <span data-x="a>b">c</span> d',
+    '# ![a > b](x.png)',
+    '# [t](https://x.test "a > b")',
+    '# See [it](https://x.test/a>b)',
+    '# a > b',
+  ];
+
+  it.each(CASES)('leaves no raw > inside an attribute of %s', (src) => {
+    const html = buildDoc('t.md', src)
+      .blocks.map((b) => b.html)
+      .join('');
+    const tags = html.match(/<[^>]*>/g) ?? [];
+    expect(tags.length).toBeGreaterThan(0);
+    for (const tag of tags) {
+      // A `>` inside a quoted value ends the match early, leaving the opening quote of
+      // that value without its partner. Counting them is how the truncation is seen.
+      expect((tag.match(/"/g) ?? []).length % 2, `unbalanced quotes in ${tag}`).toBe(0);
+    }
+  });
+});
+
+/**
+ * Lines no token covers take depth and quoted from the quote or list item they sit in
+ * (#203), the way every other line there does.
+ */
+function gaps(text: string): [number, number, boolean][] {
+  return buildDoc('/x.md', text)
+    .blocks.filter((b) => b.flags.includes('gap'))
+    .map((b) => [b.startLine, b.depth, b.quoted]);
+}
+
+describe('gap lines', () => {
+  it('sit at the depth of the list item they are in', () => {
+    expect(gaps('- a\n\n  [x]: http://y\n')).toEqual([[3, 1, false]]);
+    expect(gaps('- a\n  - b\n\n    [x]: http://y\n')).toEqual([[4, 2, false]]);
+  });
+
+  it('sit at the depth of their siblings when the line is a list marker with nothing after it', () => {
+    // The marker line is the item's own line, so it is at the item's depth, not inside it.
+    expect(gaps('- a\n-\n- c\n')).toEqual([[2, 0, false]]);
+    expect(gaps('- [x]: http://y\n- b\n')).toEqual([[1, 0, false]]);
+    expect(gaps('- a\n  - b\n  -\n')).toEqual([[3, 1, false]]);
+  });
+
+  it('are quoted when the quote opens after a list marker, which a leading > does not show', () => {
+    // The one change the page draws: the line gains the quote bar.
+    expect(gaps('- >\n')).toEqual([[1, 1, true]]);
+  });
+
+  it('take the innermost of items opened on the same line', () => {
+    // `- -` opens two items; the line and what follows belong to the inner one.
+    expect(gaps('- - a\n\n    [x]: http://y\n')).toEqual([[3, 2, false]]);
+    expect(gaps('- - a\n- -\n')).toEqual([[2, 1, false]]);
+  });
+
+  it('are quoted inside a quote opened on the list marker line', () => {
+    // The quote starts before the item's own container does, and is still inside it.
+    expect(gaps('- > a\n  >\n  > b\n')).toEqual([[2, 1, true]]);
+  });
+
+  it('are quoted inside a quote in a list, at the depth of the quote', () => {
+    expect(gaps('- a\n\n  > q\n  >\n  > r\n')).toEqual([[4, 1, true]]);
+  });
+
+  it('are quoted inside a list inside a quote, at the depth of the list item', () => {
+    expect(gaps('> - a\n>\n>   [x]: http://y\n')).toEqual([
+      [2, 1, true],
+      [3, 1, true],
+    ]);
+  });
+
+  it('stay at the top level, unquoted, outside every container', () => {
+    expect(gaps('[x]: http://y\n')).toEqual([[1, 0, false]]);
+    expect(gaps('> a\n>\n> b\n')).toEqual([[2, 0, true]]);
+  });
+
+  it('agree with the sibling items beside an empty marker', () => {
+    const d = buildDoc('/x.md', '> - a\n> -\n> - c\n');
+    const gap = d.blocks.find((b) => b.flags.includes('gap'))!;
+    const c = d.blocks.find((b) => b.text.includes('- c'))!;
+    expect([gap.depth, gap.quoted]).toEqual([c.depth, c.quoted]);
+  });
+});
+
+describe('quoted', () => {
+  it('stays set after a nested quote closes inside the outer one', () => {
+    const d = buildDoc('/x.md', '> > inner\n>\n> # Outer\n\nAfter\n');
+    const text = (s: string) => d.blocks.find((b) => b.text.includes(s))!;
+    expect(text('# Outer').quoted).toBe(true);
+    expect(text('After').quoted).toBe(false);
+  });
+});
+
+function lastOf(text: string): number[] {
+  return buildDoc('/x.md', text)
+    .blocks.filter((b) => b.flags.includes('list-last'))
+    .map((b) => b.startLine);
+}
+
+describe('list-last', () => {
+  it('marks the last row of a list, whatever kind of block it is', () => {
+    expect(lastOf('- a\n- b\n\nAfter.\n')).toEqual([2]);
+    expect(lastOf('- a\n\n  ```\n  x\n  ```\n\nAfter.\n')).toEqual([5]);
+  });
+
+  it('marks each list, a nested one included, and nothing outside a list', () => {
+    expect(lastOf('- a\n  - b\n- c\n')).toEqual([2, 3]);
+    // The last row of both a nested list and its outer one is marked once.
+    expect(buildDoc('/x.md', '- a\n  - b\n').blocks[1]!.flags.filter((f) => f === 'list-last')).toHaveLength(
+      1,
+    );
+    expect(lastOf('Para.\n\n| a |\n| - |\n| 1 |\n')).toEqual([]);
+  });
+});
