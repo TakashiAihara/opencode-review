@@ -36,7 +36,7 @@ jobs:
 
 `@main` follows this repository, so a model or prompt change here reaches every caller at once. Pin a commit instead if you want to review each change before it runs.
 
-To use other models, pass `with: { model: <provider/id> <provider/id> }`: the ids are separated by spaces, and each gets its own job and comment. A single id gives a single review.
+To use other models, pass `with: { model: <provider/id> <provider/id> }`: the ids are separated by whitespace (spaces or lines of a `|` block), and each gets its own job and comment. A single id gives a single review.
 
 `opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it; opencode's releases are immutable from 1.17.0, so that is the oldest version this accepts. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
 
@@ -64,7 +64,7 @@ reviews:
 ## Limits
 
 - Public repositories only for now. opencode fetches the PR branch without credentials.
-- When a free model is withdrawn, that model's job fails until `model` is changed here. The other model's review still runs.
+- When a free model is withdrawn, that model's job fails until `model` is changed here. The other model's review still runs and posts its comment, but the run as a whole concludes as failed.
 - inkling-2-small-free is retained and may be used for training during its free period, which suits public repositories only.
 - The model reads the PR's diff and messages, so text in them can steer what the review says. With no shell and no edits, the comment is the only thing it writes; the session that opencode records goes into the artifact.
 
