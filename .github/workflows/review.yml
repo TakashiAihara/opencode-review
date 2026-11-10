@@ -77,7 +77,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # A push makes the review of the previous head pointless. Each run still posts its own
-    # comment; nothing edits an earlier one.
+    # comment; nothing edits an earlier one. The group is per model so the two reviews of one
+    # head do not cancel each other; a model dropped from the input between two pushes therefore
+    # finishes its review of the older head.
     concurrency:
       group: opencode-review-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ matrix.reviewer.id }}
       cancel-in-progress: true
