@@ -1,12 +1,12 @@
 # opencode-review
 
-A reusable GitHub Actions workflow that reviews each pull request with [opencode](https://github.com/anomalyco/opencode) and posts the review as one comment in Japanese.
+A reusable GitHub Actions workflow that reviews each pull request with [opencode](https://github.com/anomalyco/opencode) and posts each model's review as one comment in Japanese.
 
-- The model is `opencode/glm-5.3-flash-free` from opencode Zen's free tier, which opencode's docs list as not used for training and kept 0 days. Zen's free tier only answers requests from opencode itself, which is why this runs opencode rather than calling the model directly.
+- Two models from opencode Zen's free tier review each pull request, each in its own comment, which the model is asked to begin with its name (the job name always carries it): `opencode/glm-5.3-flash-free`, which opencode's docs list as not used for training and kept 0 days, and `opencode/inkling-2-small-free`, which they list as retained and possibly used for training. Two, because each misses bugs the other finds (see [Free models tried](#free-models-tried-2026-11)). Zen's free tier only answers requests from opencode itself, which is why this runs opencode rather than calling the models directly.
 - The agent can only read: it runs as opencode's `plan` agent with no shell, no file edits, no web fetch or search, and no paths outside the repository except the PR's diff, which a step writes beforehand. The repository's own opencode config (`opencode.json`, `.opencode/`), its `.claude/skills` and `.agents/skills`, and `CLAUDE.md` are not loaded, so a PR cannot widen these. opencode's database, log and global config live in directories of the run's own.
-- Drafts are reviewed too. The latest of a burst of pushes gets a new review (earlier runs are cancelled); an earlier comment is not edited.
+- Drafts are reviewed too. The latest of a burst of pushes gets a new review (earlier runs of the same model are cancelled; a model removed from `model` between two pushes still finishes its review of the older head); an earlier comment is not edited.
 - Pull requests from forks, and runs started by a bot, are skipped: forks and Dependabot get no secrets, and opencode refuses bot actors.
-- opencode's session (the prompt, the PR text and files the model read, its replies, tool calls and reasoning, and subagent sessions) and its log are kept for 14 days as the run's artifact `opencode-review-logs`, for tuning the prompt. In a public repository anyone signed in to GitHub can download it. If the bundle contains the API key or the GitHub token as plain text, or cannot be checked, it is deleted and the job fails.
+- opencode's session (the prompt, the PR text and files the model read, its replies, tool calls and reasoning, and subagent sessions) and its log are kept for 14 days as the run's artifact `opencode-review-logs-<model>` (the model id with every character other than letters, digits, `.`, `_` and `-` replaced by `-`), one per model, for tuning the prompt. In a public repository anyone signed in to GitHub can download it. If the bundle contains the API key or the GitHub token as plain text, or cannot be checked, it is deleted and the job fails.
 
 ## Use
 
@@ -36,7 +36,7 @@ jobs:
 
 `@main` follows this repository, so a model or prompt change here reaches every caller at once. Pin a commit instead if you want to review each change before it runs.
 
-To use another model, pass `with: { model: <provider/id> }`.
+To use other models, pass `with: { model: <provider/id> <provider/id> }`: the ids are separated by whitespace (spaces or lines of a `|` block), and each gets its own job and comment. A single id gives a single review.
 
 `opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it; opencode's releases are immutable from 1.17.0, so that is the oldest version this accepts. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
 
@@ -64,5 +64,22 @@ reviews:
 ## Limits
 
 - Public repositories only for now. opencode fetches the PR branch without credentials.
-- When a free model is withdrawn, the job fails until `model` is changed here.
+- When a free model is withdrawn, that model's job fails until `model` is changed here. The other model's review still runs and posts its comment, but the run as a whole concludes as failed.
+- inkling-2-small-free is retained and may be used for training during its free period, which suits public repositories only.
 - The model reads the PR's diff and messages, so text in them can steer what the review says. With no shell and no edits, the comment is the only thing it writes; the session that opencode records goes into the artifact.
+
+## Free models tried (2026-11)
+
+Each of opencode Zen's free models on 2026-11-10 reviewed a replay of one pull request with two known bugs, through this workflow. Both bugs sit in a file outside the diff that the agent can read. The models that found either bug, and the three that timed out on the first run, ran twice; the others once. The pull request text named neither bug, and the first run's comments were deleted before the second.
+
+| Model | Known bugs found |
+|---|---|
+| `inkling-2-small-free` | 3 of 4 |
+| `minimax-m3.1-flash-free` | 3 of 4, with words of other languages mixed into the Japanese on both runs |
+| `deepseek-v4.1-flash-free` | 2 of 4, the same bug both times |
+| `glm-5.3-flash-free` | 1 of 4 (2 of 2 on one run in 2026-10) |
+| `flint-40b-free` | 1 of 2 (one run timed out), and reported a test failure that does not happen |
+| `beam-free`, `iceman-free`, `nemotron-3.5-super-vl-free`, `nemotron-3.5-lightning-free` | 0 of 2 |
+| `longcat-2.5-free`, `mimo-v2.6-flash-free` | not measured: both runs hit the job's 15-minute limit |
+
+glm-5.3-flash-free and inkling-2-small-free together found both bugs on each run.
