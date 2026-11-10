@@ -34,8 +34,10 @@ permissions:
   contents: read
 
 jobs:
-  # Turns the space-separated model input into the matrix below. slug is the id with the
-  # characters an artifact name refuses replaced.
+  # Turns the space-separated model input into the matrix below. A repeated id would share its
+  # concurrency group and artifact name with itself, so ids are made unique. slug is the id
+  # with anything but letters, digits, '.', '_' and '-' replaced, for the artifact name; two ids
+  # that differ only in those characters would still collide, which no Zen id does.
   models:
     if: >-
       github.event_name == 'pull_request' &&
@@ -53,7 +55,7 @@ jobs:
         env:
           MODELS: ${{ inputs.model }}
         run: |
-          list=$(jq -cn --arg m "$MODELS" '$m | split(" ") | map(select(. != "")) | map({id: ., slug: gsub("[/:]"; "-")})')
+          list=$(jq -cn --arg m "$MODELS" '$m | split(" ") | map(select(. != "")) | unique | map({id: ., slug: gsub("[^A-Za-z0-9._-]"; "-")})')
           [ "$(jq length <<< "$list")" -gt 0 ] || { echo "::error::The model input is empty. Pass opencode models as provider/id (see README)."; exit 1; }
           echo "list=$list" >> "$GITHUB_OUTPUT"
 
