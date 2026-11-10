@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       model:
-        description: opencode models as provider/id, separated by spaces; each posts its own review
+        description: opencode models as provider/id, separated by whitespace; each posts its own review
         type: string
         # Zen free tier. glm is not used for training and kept 0 days; inkling is retained and
         # may be used for training, which public repositories accept (opencode docs, 2026-11-10).
