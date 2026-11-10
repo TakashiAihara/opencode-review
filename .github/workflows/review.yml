@@ -7,11 +7,14 @@ on:
   workflow_call:
     inputs:
       model:
-        description: opencode model, provider/id
+        description: opencode models as provider/id, separated by spaces; each posts its own review
         type: string
-        # Zen free tier, not used for training and kept 0 days (opencode docs, 2026-10-21).
-        # Free models are withdrawn without notice; that shows as this job failing.
-        default: opencode/glm-5.3-flash-free
+        # Zen free tier. glm is not used for training and kept 0 days; inkling is retained and
+        # may be used for training, which public repositories accept (opencode docs, 2026-11-10).
+        # Two because on a replay of a PR with two known bugs each found 1 of 4 and 3 of 4 over
+        # two runs, and together both bugs on each run (README). Free models are withdrawn
+        # without notice; that shows as that model's job failing.
+        default: opencode/glm-5.3-flash-free opencode/inkling-2-small-free
       opencode-version:
         description: opencode release to review with, as 1.Y.Z (2.x has no github run command)
         type: string
@@ -31,7 +34,37 @@ permissions:
   contents: read
 
 jobs:
+  # Turns the space-separated model input into the matrix below. slug is the id with the
+  # characters an artifact name refuses replaced.
+  models:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !endsWith(github.actor, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.split.outputs.list }}
+    steps:
+      # An unset variable passed as model still satisfies the input, and opencode then fails
+      # without naming it.
+      - name: Split the model input
+        id: split
+        env:
+          MODELS: ${{ inputs.model }}
+        run: |
+          list=$(jq -cn --arg m "$MODELS" '$m | split(" ") | map(select(. != "")) | map({id: ., slug: gsub("[/:]"; "-")})')
+          [ "$(jq length <<< "$list")" -gt 0 ] || { echo "::error::The model input is empty. Pass opencode models as provider/id (see README)."; exit 1; }
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
   review:
+    needs: models
+    strategy:
+      # One model's failure (withdrawn, timed out) must not cancel the other's review.
+      fail-fast: false
+      matrix:
+        reviewer: ${{ fromJSON(needs.models.outputs.list) }}
+    name: review (${{ matrix.reviewer.id }})
     # Fork PRs get no secrets, so the run could only fail. pull_request_target is not used
     # because it would hand the secret to code from the fork. A run started by Dependabot
     # gets no Actions secrets either, and opencode refuses any bot actor (its permission check
@@ -46,7 +79,7 @@ jobs:
     # A push makes the review of the previous head pointless. Each run still posts its own
     # comment; nothing edits an earlier one.
     concurrency:
-      group: opencode-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: opencode-review-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ matrix.reviewer.id }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -55,13 +88,6 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      # An unset variable passed as model still satisfies the input, and opencode then fails
-      # without naming it.
-      - name: Check that a model was given
-        if: inputs.model == ''
-        run: |
-          echo "::error::The model input is empty. Pass an opencode model as provider/id (see README)."
-          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The merge base below needs the history of both sides.
@@ -178,7 +204,7 @@ jobs:
           # Set to an absolute path it would take precedence over the data directory; empty is
           # read as unset (1.19.5 core/src/database/database.ts).
           OPENCODE_DB: ""
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ matrix.reviewer.id }}
           USE_GITHUB_TOKEN: "true"
           # 1.17.0 to 1.19.0 read it (1.19.4 does not): unset, they share a public repository's
           # session through opencode.ai.
@@ -210,12 +236,13 @@ jobs:
           OPENCODE_DISABLE_EXTERNAL_SKILLS: "true"
           OPENCODE_CONFIG_CONTENT: >-
             {"default_agent": "plan", "share": "disabled",
-            "small_model": ${{ toJSON(inputs.model) }}, "permission": {"edit": "deny",
+            "small_model": ${{ toJSON(matrix.reviewer.id) }}, "permission": {"edit": "deny",
             "bash": "deny", "webfetch": "deny", "websearch": "deny", "external_directory":
             {"*": "deny", "${{ runner.temp }}/opencode-review/*": "allow"}},
             "instructions": ["${{ runner.temp }}/opencode-review/instructions.md"]}
           PROMPT: |
             このプルリクエストをレビューし、結果を日本語で 1 件のコメントにまとめてください。
+            - コメントの 1 行目は `レビュー: ${{ matrix.reviewer.id }}` とだけ書く (同じ PR に別のモデルのレビューも付くため)
             - 変更の diff は `${{ runner.temp }}/opencode-review/pr.diff` にある。まずそれを読み、周りのコードはリポジトリのファイルを読んで確かめる
             - 既存のコメントやレビューの指摘は繰り返さず、変更そのものを独立に見る
             - ファイルを編集しない。コマンドは使えない
@@ -275,7 +302,8 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.collect.outcome == 'success'
         with:
-          name: opencode-review-logs
+          # Names are unique within a run, and each model's job uploads one.
+          name: opencode-review-logs-${{ matrix.reviewer.slug }}
           path: ${{ runner.temp }}/opencode-review/logs
           if-no-files-found: ignore
           # Two weeks of reviews to compare prompt changes against; the bundle was 41 KB zipped
