@@ -6,7 +6,7 @@ A reusable GitHub Actions workflow that reviews each pull request with [opencode
 - The agent can only read: it runs as opencode's `plan` agent with no shell, no file edits, no web fetch or search, and no paths outside the repository except the PR's diff, which a step writes beforehand. The repository's own opencode config (`opencode.json`, `.opencode/`), its `.claude/skills` and `.agents/skills`, and `CLAUDE.md` are not loaded, so a PR cannot widen these. opencode's database, log and global config live in directories of the run's own.
 - Drafts are reviewed too. The latest of a burst of pushes gets a new review (earlier runs are cancelled); an earlier comment is not edited.
 - Pull requests from forks, and runs started by a bot, are skipped: forks and Dependabot get no secrets, and opencode refuses bot actors.
-- opencode's session (the prompt, the PR text and files the model read, its replies, tool calls and reasoning, and subagent sessions) and its log are kept for 14 days as the run's artifact `opencode-review-logs`, for tuning the prompt. In a public repository anyone signed in to GitHub can download it. If the bundle contains the API key or the GitHub token as plain text, or cannot be checked, it is deleted and the job fails.
+- opencode's session (the prompt, the PR text and files the model read, its replies, tool calls and reasoning, and subagent sessions) and its log are kept for 14 days as the run's artifact `opencode-review-logs-<model>` (the model with `/` and other characters artifact names refuse turned into `-`, such as `opencode-review-logs-opencode-glm-5.3-flash-free`), for tuning the prompt. In a public repository anyone signed in to GitHub can download it. If the bundle contains the API key or the GitHub token as plain text, or cannot be checked, it is deleted and the job fails.
 
 ## Use
 
@@ -36,7 +36,7 @@ jobs:
 
 `@main` follows this repository, so a model or prompt change here reaches every caller at once. Pin a commit instead if you want to review each change before it runs.
 
-To use another model, pass `with: { model: <provider/id> }`.
+To use another model, pass `with: { model: <provider/id> }`. To review with several models, add one job per model that calls this workflow; runs with different models neither cancel each other nor clash on the artifact name.
 
 `opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it; opencode's releases are immutable from 1.17.0, so that is the oldest version this accepts. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
 
