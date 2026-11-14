@@ -44,9 +44,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # A push makes the review of the previous head pointless. Each run still posts its own
-    # comment; nothing edits an earlier one.
+    # comment; nothing edits an earlier one. The model is in the group so a caller can review
+    # the same PR with several models without each run cancelling the others.
     concurrency:
-      group: opencode-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: opencode-review-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.model }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -241,7 +242,14 @@ jobs:
           XDG_DATA_HOME: ${{ runner.temp }}/opencode-review-data/data
           XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-review-data/config
           OPENCODE_DB: ""
+          # Not MODEL: opencode github run reads that, and opencode runs again in this step.
+          ARTIFACT_MODEL: ${{ inputs.model }}
         run: |
+          # One artifact per model, so runs with different models in one workflow run do not
+          # conflict on the name. upload-artifact refuses these characters in a name.
+          # shortcut: two ids that differ only in these characters and - (provider/a-b and
+          # provider-a/b) get the same name; add a hash of the id if a caller ever needs both.
+          echo "artifact=opencode-review-logs-$(printf '%s' "$ARTIFACT_MODEL" | tr '/\\":<>|*?\r\n' '-')" >> "$GITHUB_OUTPUT"
           out="$RUNNER_TEMP/opencode-review/logs"
           mkdir -p "$out"
           command -v opencode >/dev/null || { echo "opencode was not installed; nothing to collect"; exit 0; }
@@ -275,7 +283,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.collect.outcome == 'success'
         with:
-          name: opencode-review-logs
+          name: ${{ steps.collect.outputs.artifact }}
           path: ${{ runner.temp }}/opencode-review/logs
           if-no-files-found: ignore
           # Two weeks of reviews to compare prompt changes against; the bundle was 41 KB zipped
