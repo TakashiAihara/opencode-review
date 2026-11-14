@@ -36,7 +36,7 @@ jobs:
 
 `@main` follows this repository, so a model or prompt change here reaches every caller at once. Pin a commit instead if you want to review each change before it runs.
 
-To use another model, pass `with: { model: <provider/id> }`. To review with several models, add one job per model that calls this workflow; runs with different models neither cancel each other nor clash on the artifact name.
+To use another model, pass `with: { model: <provider/id> }`. To review with several models, add one job per model that calls this workflow; runs with different models neither cancel each other nor clash on the artifact name, unless two model ids differ only where the artifact name turns characters into `-`.
 
 `opencode-version` picks the [opencode release](https://github.com/anomalyco/opencode/releases) to review with, as `1.Y.Z` (2.x has no `github run` command). It defaults to `1.19.5`, and a new upstream release does not change it. Only an immutable release is accepted, and the download is checked against the sha256 digest GitHub recorded for it; opencode's releases are immutable from 1.17.0, so that is the oldest version this accepts. opencode's own GitHub action is not used, because it takes no version and installs whatever release is marked latest.
 

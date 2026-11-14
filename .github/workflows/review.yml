@@ -242,11 +242,14 @@ jobs:
           XDG_DATA_HOME: ${{ runner.temp }}/opencode-review-data/data
           XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-review-data/config
           OPENCODE_DB: ""
-          MODEL: ${{ inputs.model }}
+          # Not MODEL: opencode github run reads that, and opencode runs again in this step.
+          ARTIFACT_MODEL: ${{ inputs.model }}
         run: |
           # One artifact per model, so runs with different models in one workflow run do not
           # conflict on the name. upload-artifact refuses these characters in a name.
-          echo "artifact=opencode-review-logs-$(printf '%s' "$MODEL" | tr '/\\":<>|*?\r\n' '-')" >> "$GITHUB_OUTPUT"
+          # shortcut: two ids that differ only in these characters and - (provider/a-b and
+          # provider-a/b) get the same name; add a hash of the id if a caller ever needs both.
+          echo "artifact=opencode-review-logs-$(printf '%s' "$ARTIFACT_MODEL" | tr '/\\":<>|*?\r\n' '-')" >> "$GITHUB_OUTPUT"
           out="$RUNNER_TEMP/opencode-review/logs"
           mkdir -p "$out"
           command -v opencode >/dev/null || { echo "opencode was not installed; nothing to collect"; exit 0; }
