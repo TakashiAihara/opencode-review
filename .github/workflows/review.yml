@@ -1,17 +1,16 @@
 name: review
 
-# Called from each repository's pull_request workflow (see README). Kept in one place so a
-# withdrawn free model, the opencode version, its permissions or the prompt is changed once,
-# not per repository.
+# Called from each repository's pull_request workflow (see README). Kept in one place so the
+# opencode version, its permissions or the prompt is changed once, not per repository.
 on:
   workflow_call:
     inputs:
       model:
         description: opencode model, provider/id
         type: string
-        # Zen free tier, not used for training and kept 0 days (opencode docs, 2026-10-21).
-        # Free models are withdrawn without notice; that shows as this job failing.
-        default: opencode/glm-5.3-flash-free
+        # No default: the caller picks the model for its data terms, and when a free model is
+        # withdrawn only the callers that named it fail.
+        required: true
       opencode-version:
         description: opencode release to review with, as 1.Y.Z (2.x has no github run command)
         type: string

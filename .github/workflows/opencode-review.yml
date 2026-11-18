@@ -16,5 +16,8 @@ jobs:
       pull-requests: write
       issues: write
     uses: ./.github/workflows/review.yml
+    with:
+      # Zen free tier, zero retention and not used for training (opencode Zen docs, 2026-11-19).
+      model: opencode/deepseek-v4.1-flash-free
     secrets:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
