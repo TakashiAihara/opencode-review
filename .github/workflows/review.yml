@@ -41,7 +41,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Free-tier models can need ~15 min on a large diff; the job was being
+    # cancelled in post-run cleanup after the review comment already posted.
+    timeout-minutes: 25
     # A push makes the review of the previous head pointless. Each run still posts its own
     # comment; nothing edits an earlier one. The model is in the group so a caller can review
     # the same PR with several models without each run cancelling the others.
