@@ -87,6 +87,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/opencode-review"
           git diff "$merge_base" "$HEAD_SHA" > "$RUNNER_TEMP/opencode-review/pr.diff"
           echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+      # opencode runs `git checkout <head branch>` with no `--` (1.19.5 github.handler.ts). With
+      # no local branch of that name git guesses, and refuses when the name is also a path in
+      # the tree. An existing local branch is taken as the branch. It points at the event's head,
+      # the commit the diff above ends at.
+      - name: Create the head branch locally
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git branch -- "$HEAD_REF" "$HEAD_SHA"
       # Same shape as CodeRabbit's reviews.path_instructions; entries copy over unless their glob
       # uses minimatch syntax git lacks (README). Read from the base so a PR cannot edit it for
       # its own review; a change takes effect once merged. Only entries whose glob touches the
